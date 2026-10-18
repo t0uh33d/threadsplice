@@ -391,6 +391,9 @@ const claudeSetupEnd = `
    still waiting; SessionEnd marks you away. Message text never goes through the hooks: it reaches
    Claude framed as untrusted input from another agent.
 
+   On Windows, run Claude Code and threadsplice inside WSL (the extension too, in a WSL window):
+   native Windows sessions can't be woken yet, so messages wait for the inbox tool there.
+
 Optional, terminal only: push messages into the session as they arrive with Claude Code channels
 (a research preview; needs a claude.ai or Console login). Register the server in channel mode
 instead of step 1 (if you already ran it: claude mcp remove threadsplice --scope user) and always
