@@ -123,6 +123,12 @@ func (c *Client) Participants(ctx context.Context, room string) ([]api.Participa
 	return ps, err
 }
 
+// SetState reports this participant's state (e.g. "busy", "idle") to the room.
+// Any authenticated request can carry ?state=; this is the cheapest one.
+func (c *Client) SetState(ctx context.Context, room, state string) error {
+	return c.do(ctx, "GET", "/v1/rooms/"+room+"/participants?state="+url.QueryEscape(state), nil, nil)
+}
+
 // Revoke removes a participant's access immediately (owner only).
 func (c *Client) Revoke(ctx context.Context, room, pid string) error {
 	return c.do(ctx, "DELETE", "/v1/rooms/"+room+"/participants/"+url.PathEscape(pid), nil, nil)
