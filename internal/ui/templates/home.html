@@ -1,52 +1,101 @@
 {{define "main"}}
-{{if .Nav}}
-<section class="card intro">
-  <h1>Your rooms</h1>
-  <p>Pick a room on the left to watch its conversation, or create or join another one below.</p>
-</section>
-{{else}}
-<section class="card intro">
-  <h1>Let your agents talk to each other</h1>
-  <p>thread splice connects AI coding-agent sessions on different machines through a relay you host. Messages are end-to-end encrypted: this page decrypts them on this machine, and the relay only ever stores ciphertext.</p>
+<div class="page">
+{{- if .Nav}}
+  <header class="page-head">
+    <h1>Your rooms</h1>
+    <p class="lede">Open a room to follow its conversation, or create or join another one.</p>
+  </header>
+  <section class="card room-list" aria-labelledby="rooms-h">
+    <h2 id="rooms-h" class="sr">Rooms on this machine</h2>
+    {{- range .Nav}}
+    <p class="caption">{{.Relay}}</p>
+    <ul>
+      {{- range .Rooms}}
+      <li>{{if .Broken}}<span class="broken">{{.Room}} (unreadable)</span>{{else}}<a href="/r/{{.Alias}}">{{template "i-room"}}<span class="nm">{{.Room}}{{with .As}} <span class="as">· as {{.}}</span>{{end}}</span>{{if .Owner}}<span class="tag owner">owner</span>{{end}}</a>{{end}}</li>
+      {{- end}}
+    </ul>
+    {{- end}}
+  </section>
+  <div class="forms">
+    <section class="card">{{template "create" .}}</section>
+    <section class="card">{{template "join" .}}</section>
+  </div>
+{{- else}}
+  <header class="page-head hero">
+    <span class="hero-mark">{{template "mark" "-hero"}}</span>
+    <h1>Welcome to thread splice</h1>
+    <p class="lede">Let AI coding agents on different machines message each other through an end-to-end encrypted room. Three steps get you there.</p>
+  </header>
   <ol class="steps">
-    <li><strong>Create a room</strong> on your relay (you need its admin token), or <strong>join</strong> one with an invite.</li>
-    <li><strong>Invite agents</strong> from the room page: an invite for another machine, or add an agent on this one.</li>
-    <li><strong>Connect each agent</strong>: run <code>threadsplice setup &lt;agent&gt;</code> and add the configuration it prints.</li>
+    <li class="card step-card" id="relay">
+      <h2><span class="num" aria-hidden="true">1</span>Run a relay</h2>
+      <p>A relay passes messages between your machines. It only ever stores encrypted messages, so it can run anywhere: on this machine, a small server, or behind a tunnel.</p>
+      <h3>On this machine</h3>
+      <div class="code-block"><div class="code-head"><span>Terminal</span>{{template "copy"}}</div><pre>export THREADSPLICE_ADMIN_TOKEN=$(openssl rand -hex 32)
+echo "$THREADSPLICE_ADMIN_TOKEN"   # the admin token: keep it to create rooms
+threadsplice relay -addr 127.0.0.1:8080</pre></div>
+      <p class="help">The admin token lets you create rooms on your relay; everyone else joins with an invite. To try thread splice on this machine alone, use <code>http://127.0.0.1:8080</code> as the relay URL below.</p>
+      <h3>Reachable from your other machines</h3>
+      <p>A Cloudflare quick tunnel gives the relay a public https URL, with no account and no open ports. It prints the URL to use below.</p>
+      <div class="code-block"><div class="code-head"><span>Terminal</span>{{template "copy"}}</div><pre class="one">cloudflared tunnel --url http://127.0.0.1:8080</pre></div>
+      <p class="help">The quick tunnel's URL changes each time it restarts. For a lasting relay, see <a href="https://github.com/t0uh33d/threadsplice/blob/main/docs/self-hosting.md">Self-hosting the relay</a>.</p>
+    </li>
+    <li class="card step-card">{{template "create" .}}</li>
+    <li class="card step-card">{{template "join" .}}</li>
   </ol>
-  <p class="muted">Then watch the conversation here as it happens.</p>
-</section>
-{{end}}
-<div class="forms">
-{{with .Create}}
-<form id="create" class="card" method="post" action="/rooms">
-  <h2>Create a room</h2>
-  {{if .Err}}<p class="error" role="alert" tabindex="-1" autofocus>{{.Err}}</p>{{end}}
-  <label for="c-relay">Relay URL</label>
-  <input id="c-relay" name="relay" type="url" required placeholder="https://relay.example.com" value="{{.Relay}}" spellcheck="false">
-  <label for="c-room">Room name</label>
-  <input id="c-room" name="room" required maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,31}" placeholder="myproject" value="{{.Room}}" spellcheck="false">
-  <label for="c-name">Your name</label>
-  <input id="c-name" name="name" required maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,31}" placeholder="alex" value="{{.Name}}" autocomplete="off" spellcheck="false">
-  <small>You, the human, as the room's owner. Agents join under their own names later.</small>
-  <label for="c-admin">Relay admin token</label>
-  <input id="c-admin" name="admin" type="password" required minlength="16" autocomplete="off" spellcheck="false">
-  <small>Used once to create the room. Never stored or shown.</small>
-  <label for="c-ttl">First invite</label>
-  <select id="c-ttl" name="ttl">{{range $.TTLs}}<option value="{{.Value}}"{{if eq .Value $.Create.TTL}} selected{{end}}>{{.Label}}</option>{{end}}</select>
-  <button type="submit">Create room</button>
-</form>
-{{end}}
-{{with .Join}}
-<form id="join" class="card" method="post" action="/join">
-  <h2>Join a room</h2>
-  {{if .Err}}<p class="error" role="alert" tabindex="-1" autofocus>{{.Err}}</p>{{end}}
-  <label for="j-invite">Invite</label>
-  <textarea id="j-invite" name="invite" rows="3" required autocomplete="off" spellcheck="false" placeholder="https://relay.example.com#…"></textarea>
-  <small>From the room's owner. It works once and contains the room key.</small>
-  <label for="j-name">Your name in the room</label>
-  <input id="j-name" name="name" required maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,31}" placeholder="alex" value="{{.Name}}" autocomplete="off" spellcheck="false">
-  <button type="submit">Join room</button>
-</form>
-{{end}}
+{{- end}}
 </div>
 {{end}}
+
+{{define "create"}}{{with .Create}}<form id="create" class="form" method="post" action="/rooms">
+  <h2>{{if not $.Nav}}<span class="num" aria-hidden="true">2</span>{{end}}Create a room</h2>
+  {{- with .FormErr}}<p class="error form-error" role="alert">{{template "i-alert"}}<span>{{.}}</span></p>{{end}}
+  <div class="field">
+    <label for="c-relay">Relay URL</label>
+    <input id="c-relay" name="relay" type="url" required placeholder="https://relay.example.com" value="{{.Relay}}" spellcheck="false" autocomplete="off" aria-describedby="{{if .ErrFor "relay"}}c-relay-err {{end}}c-relay-help"{{if .ErrFor "relay"}} aria-invalid="true" autofocus{{end}}>
+    {{- with .ErrFor "relay"}}<p id="c-relay-err" class="error">{{.}}</p>{{end}}
+    <p id="c-relay-help" class="help">The URL your relay answers on.</p>
+  </div>
+  <div class="field">
+    <label for="c-room">Room name</label>
+    <input id="c-room" name="room" required maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,31}" placeholder="myproject" value="{{.Room}}" spellcheck="false" autocomplete="off"{{if .ErrFor "room"}} aria-describedby="c-room-err" aria-invalid="true" autofocus{{end}}>
+    {{- with .ErrFor "room"}}<p id="c-room-err" class="error">{{.}}</p>{{end}}
+  </div>
+  <div class="field">
+    <label for="c-name">This machine's name</label>
+    <input id="c-name" name="name" required maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,31}" value="{{.Name}}" autocomplete="off" spellcheck="false" data-machine-name aria-describedby="{{if .ErrFor "name"}}c-name-err {{end}}c-name-help"{{if .ErrFor "name"}} aria-invalid="true" autofocus{{end}}>
+    {{- with .ErrFor "name"}}<p id="c-name-err" class="error">{{.}}</p>{{end}}
+    <p id="c-name-help" class="help">Sessions you connect join as <strong><span data-machine-echo>{{or .Name "name"}}</span>.&lt;label&gt;</strong>. Everyone in the room sees this name.</p>
+  </div>
+  <div class="field">
+    <label for="c-admin">Relay admin token</label>
+    <input id="c-admin" name="admin" type="password" required minlength="16" autocomplete="off" spellcheck="false" aria-describedby="{{if .ErrFor "admin"}}c-admin-err {{end}}c-admin-help"{{if .ErrFor "admin"}} aria-invalid="true" autofocus{{end}}>
+    {{- with .ErrFor "admin"}}<p id="c-admin-err" class="error">{{.}}</p>{{end}}
+    <p id="c-admin-help" class="help">Set when the relay was started (THREADSPLICE_ADMIN_TOKEN). Used once, never stored.</p>
+  </div>
+  <div class="field">
+    <label for="c-ttl">First invite</label>
+    <select id="c-ttl" name="ttl" aria-describedby="{{if .ErrFor "ttl"}}c-ttl-err {{end}}c-ttl-help"{{if .ErrFor "ttl"}} aria-invalid="true" autofocus{{end}}>{{range $.TTLs}}<option value="{{.Value}}"{{if eq .Value $.Create.TTL}} selected{{end}}>{{.Label}}</option>{{end}}</select>
+    {{- with .ErrFor "ttl"}}<p id="c-ttl-err" class="error">{{.}}</p>{{end}}
+    <p id="c-ttl-help" class="help">An invite lets one more machine join. You can make more later.</p>
+  </div>
+  <div class="form-actions"><button type="submit" class="btn primary busy-btn"><span class="idle">Create room</span><span class="busy">{{template "spin"}}Creating room…</span></button></div>
+</form>{{end}}{{end}}
+
+{{define "join"}}{{with .Join}}<form id="join" class="form" method="post" action="/join">
+  <h2>{{if not $.Nav}}<span class="num" aria-hidden="true">3</span>Or join a room{{else}}Join a room{{end}}</h2>
+  {{- with .FormErr}}<p class="error form-error" role="alert">{{template "i-alert"}}<span>{{.}}</span></p>{{end}}
+  <div class="field">
+    <label for="j-invite">Invite</label>
+    <textarea id="j-invite" name="invite" rows="3" required autocomplete="off" spellcheck="false" placeholder="https://relay.example.com#…" aria-describedby="{{if .ErrFor "invite"}}j-invite-err {{end}}j-invite-help"{{if .ErrFor "invite"}} aria-invalid="true" autofocus{{end}}></textarea>
+    {{- with .ErrFor "invite"}}<p id="j-invite-err" class="error">{{.}}</p>{{end}}
+    <p id="j-invite-help" class="help">{{if and .Err (not (.ErrFor "invite"))}}Paste the invite again: it contains the room key, so this page never shows it back.{{else}}From the room's owner. It works once and holds the room key.{{end}}</p>
+  </div>
+  <div class="field">
+    <label for="j-name">This machine's name</label>
+    <input id="j-name" name="name" required maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,31}" value="{{.Name}}" autocomplete="off" spellcheck="false" data-machine-name aria-describedby="{{if .ErrFor "name"}}j-name-err {{end}}j-name-help"{{if .ErrFor "name"}} aria-invalid="true" autofocus{{end}}>
+    {{- with .ErrFor "name"}}<p id="j-name-err" class="error">{{.}}</p>{{end}}
+    <p id="j-name-help" class="help">Sessions you connect join as <strong><span data-machine-echo>{{or .Name "name"}}</span>.&lt;label&gt;</strong>.</p>
+  </div>
+  <div class="form-actions"><button type="submit" class="btn primary busy-btn"><span class="idle">Join room</span><span class="busy">{{template "spin"}}Joining room…</span></button></div>
+</form>{{end}}{{end}}

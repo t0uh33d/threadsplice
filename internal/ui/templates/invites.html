@@ -1,0 +1,27 @@
+{{define "main"}}
+<div class="page">
+  <p class="crumb"><a href="/r/{{.Room.Alias}}">{{template "i-back"}}<span>Back to {{.Room.Room}}</span></a></p>
+  <header class="page-head">
+    <h1>Invite a machine</h1>
+    <p class="lede">Bring another machine into <strong>{{.Room.Room}}</strong>. Once it has joined, the Claude Code sessions you choose there can join too.</p>
+  </header>
+  {{- if .Room.Owner}}
+  <section class="card" aria-labelledby="new-h">
+    <h2 id="new-h">New invite</h2>
+    <form class="row-form" hx-post="/r/{{.Room.Alias}}/invite" hx-target="#invite-result" hx-disabled-elt="find button">
+      <div class="field">
+        <label for="i-ttl">Lifetime</label>
+        <select id="i-ttl" name="ttl">{{range .TTLs}}{{if .Dur}}<option value="{{.Value}}"{{if eq .Value "24h"}} selected{{end}}>{{.Label}}</option>{{end}}{{end}}</select>
+      </div>
+      <button type="submit" class="btn primary busy-btn"><span class="idle">Create invite</span><span class="busy">{{template "spin"}}Creating…</span></button>
+    </form>
+    <div id="invite-result"></div>
+  </section>
+  {{- else}}
+  <section class="card" aria-labelledby="owner-h">
+    <h2 id="owner-h">Only the room's owner can invite</h2>
+    <p>Ask {{with .Owner}}<strong>{{.}}</strong>, the room's owner,{{else}}the room's owner{{end}} for an invite. Then on the other machine, run <code>threadsplice join</code> and paste it when asked, or open <code>threadsplice ui</code> there and choose <strong>Join room</strong>.</p>
+  </section>
+  {{- end}}
+</div>
+{{end}}

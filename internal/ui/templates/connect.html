@@ -1,0 +1,56 @@
+{{define "main"}}
+<div class="page">
+  <p class="crumb"><a href="/r/{{.Room.Alias}}">{{template "i-back"}}<span>Back to {{.Room.Room}}</span></a></p>
+  <header class="page-head">
+    <h1>Connect an agent</h1>
+    <p class="lede">Bring a Claude Code session on this machine into <strong>{{.Room.Room}}</strong>. Only the sessions you ask join, each as its own member.</p>
+  </header>
+  <ol class="steps">
+    <li class="card step-card">
+      <h2><span class="num" aria-hidden="true">1</span>Register thread splice with Claude Code</h2>
+      <p>Once per machine. The terminal CLI and the VS Code extension share it.</p>
+      <div class="code-block"><div class="code-head"><span>Terminal</span>{{template "copy"}}</div><pre class="one">claude mcp add --scope user threadsplice -- threadsplice mcp</pre></div>
+    </li>
+    <li class="card step-card">
+      <h2><span class="num" aria-hidden="true">2</span>Recommended: add hooks</h2>
+      <p>Add them to <code>~/.claude/settings.json</code>, merged into any "hooks" you already have. With them, messages wake an idle session and Claude knows who is in the room; sessions that haven't joined stay silent.</p>
+      <div class="code-block"><div class="code-head"><span>~/.claude/settings.json</span>{{template "copy"}}</div><pre>{{.Hooks}}</pre></div>
+    </li>
+    <li class="card step-card">
+      <h2><span class="num" aria-hidden="true">3</span>In the chat you want to connect, say:</h2>
+      <div class="code-block"><div class="code-head"><span>Claude chat</span>{{template "copy"}}</div><pre class="one">{{.Phrase}}</pre></div>
+      <ul class="facts">
+        <li>That session joins as <strong>{{.Room.Name}}.reviewer</strong>, once you allow it in Claude's permission prompt.</li>
+        <li>Without “as …”, it's named after the repo or folder it runs in, like <strong>{{.Room.Name}}.myproject</strong>.</li>
+        <li>Other sessions on this machine stay out until you ask them too.</li>
+        <li>A joined session you resume later rejoins by itself. To take one out, say “leave the thread splice room”.</li>
+        {{- if .NameRoom}}
+        <li>This machine is in more than one room, so the phrase names this one.</li>
+        {{- end}}
+      </ul>
+    </li>
+  </ol>
+  <section class="card" aria-labelledby="live-h">
+    <h2 id="live-h">Sessions from this machine in this room</h2>
+    {{template "sessions" .Sessions}}
+  </section>
+  <section class="card" aria-labelledby="other-h">
+    <h2 id="other-h">Other agents (Codex, Copilot, VS Code Copilot)</h2>
+    <p>These don't join from the chat. Each uses a fixed member of its own: create an invite, run <code>threadsplice join -as codex-{{.Room.Name}}</code> on this machine and paste the invite, then follow that agent's setup.</p>
+    <p class="links">{{range .Targets}}<a class="btn" href="/setup/{{.}}">Set up {{agentName .}}</a>{{end}}</p>
+  </section>
+  <p class="callout">{{template "i-info"}}<span>On Windows, run Claude Code in WSL for live delivery (the VS Code extension too, in a WSL window). Native Windows sessions get messages only when they check their inbox.</span></p>
+  {{- if .Exe}}
+  <p class="help">These commands run threadsplice from Claude Code's PATH. If it can't find it there, use the full path: <code>{{.Exe}}</code></p>
+  {{- end}}
+  {{- if .Home}}
+  <p class="help">THREADSPLICE_HOME is set (<code>{{.Home}}</code>): Claude Code must run with the same value, or its sessions won't find this machine's membership.</p>
+  {{- end}}
+</div>
+{{end}}
+
+{{define "sessions"}}<div id="sessions" class="sessions" hx-get="/r/{{.Room.Alias}}/sessions" hx-trigger="every 3s" hx-swap="outerHTML" data-names="{{range .Sessions}}{{.Name}} {{end}}">
+{{- if .Err}}<p class="error" role="alert">{{.Err}}</p>{{end}}
+{{- with .Sessions}}<ul class="tree">{{range .}}<li class="member session">{{template "member" .}}</li>{{end}}</ul>
+{{- else}}{{if not .Err}}<p class="empty-line">None yet. They appear here as soon as a session joins.</p>{{end}}{{end}}
+</div>{{end}}

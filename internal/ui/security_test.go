@@ -259,19 +259,25 @@ func TestStateChangesNeedPost(t *testing.T) {
 	if r.code != http.StatusSeeOther {
 		t.Fatalf("create: %d", r.code)
 	}
-	for _, p := range []string{"/r/alice/send?to=&kind=ask&text=hi", "/r/alice/invite?ttl=1h", "/r/alice/agents?name=mallory", "/r/alice/revoke?pid=x"} {
+	for _, p := range []string{"/r/alice/send?to=&kind=ask&text=hi", "/r/alice/invite?ttl=1h", "/r/alice/revoke?pid=x"} {
 		if r := e.get(p); r.code != http.StatusMethodNotAllowed {
 			t.Errorf("GET %s: %d", p, r.code)
 		}
 	}
-	// Query parameters never stand in for the form.
-	must(t, e.hx(http.MethodPost, "/r/alice/agents?name=mallory", url.Values{}), http.StatusUnprocessableEntity)
-	for _, ct := range []string{"text/plain", "multipart/form-data; boundary=B", "application/json"} {
-		body := "name=mallory"
-		if strings.HasPrefix(ct, "multipart") {
-			body = "--B\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nmallory\r\n--B--\r\n"
+	// The old one-click "add an agent on this machine" is gone for good.
+	for _, m := range []string{http.MethodGet, http.MethodPost} {
+		if r := e.do(m, "/r/alice/agents", url.Values{"name": {"mallory"}}, map[string]string{"HX-Request": "true"}); r.code != http.StatusNotFound && r.code != http.StatusMethodNotAllowed {
+			t.Errorf("%s /r/alice/agents: %d", m, r.code)
 		}
-		req, _ := http.NewRequest(http.MethodPost, e.ui+"/r/alice/agents", strings.NewReader(body))
+	}
+	// Query parameters never stand in for the form.
+	must(t, e.hx(http.MethodPost, "/r/alice/send?kind=message&text=mallory", url.Values{}), http.StatusUnprocessableEntity, "Write something")
+	for _, ct := range []string{"text/plain", "multipart/form-data; boundary=B", "application/json"} {
+		body := "kind=message&text=mallory"
+		if strings.HasPrefix(ct, "multipart") {
+			body = "--B\r\nContent-Disposition: form-data; name=\"text\"\r\n\r\nmallory\r\n--B--\r\n"
+		}
+		req, _ := http.NewRequest(http.MethodPost, e.ui+"/r/alice/send", strings.NewReader(body))
 		req.Header.Set("Content-Type", ct)
 		req.Header.Set("Sec-Fetch-Site", "same-origin")
 		req.Header.Set("HX-Request", "true")
@@ -291,6 +297,9 @@ func TestStateChangesNeedPost(t *testing.T) {
 	if ps, err := a.Peers(context.Background()); err != nil || len(ps) != 1 {
 		t.Fatalf("participants after GETs and odd bodies: %v %v", ps, err)
 	}
+	if msgs, _, err := a.Log(context.Background(), 0, 0); err != nil || len(msgs) != 0 {
+		t.Fatalf("messages after GETs and odd bodies: %v %v", msgs, err)
+	}
 }
 
 func TestTraversal(t *testing.T) {
@@ -301,7 +310,8 @@ func TestTraversal(t *testing.T) {
 	}
 	for _, p := range []string{"/static/..%2Fui.go", "/static/%2e%2e%2fui.go", "/static/htmx.LICENSE", "/static/", "/static/ui.js%00.css",
 		"/static/..%2Ftemplates%2Flayout.html", "/templates/layout.html", "/STATIC/ui.js", "/r/..%2Fsecret", "/r/%2e%2e", "/r/..",
-		"/r/ALICE", "/r/secret", "/setup/..%2Fclaude", "/setup/claude?as=..%2Fsecret", "/setup/claude?as=secret"} {
+		"/r/ALICE", "/r/secret", "/setup/..%2Fclaude", "/setup/claude?as=..%2Fsecret", "/setup/claude?as=secret",
+		"/r/..%2Fsecret/connect", "/r/secret/invites", "/r/secret/sessions"} {
 		st, _ := rawHTTP(t, addr, "GET "+p+" HTTP/1.1\r\nHost: "+addr+"\r\nCookie: ts_ui="+e.token+"\r\nConnection: close\r\n\r\n")
 		if !strings.Contains(st, " 404 ") && !strings.Contains(st, " 307 ") && !strings.Contains(st, " 301 ") {
 			t.Errorf("GET %s: %s", p, st)
@@ -330,6 +340,14 @@ func hostileRelay(t *testing.T, key e2ee.Key, room string) *httptest.Server {
 			{ID: "ME", Name: "alice", Owner: true, Online: true, State: "idle"},
 			{ID: evil + bidi, Name: evil + bidi, State: evil, Online: true, LastSeen: time.Now()},
 			{ID: bidi + "BOB", Name: "bob", State: "busy"},
+			// Session members: one genuine, the rest claiming machines they don't belong to.
+			{ID: "KID1", Name: "alice.rev", Parent: "ME", Online: true, State: "busy"},
+			{ID: "KID2", Name: evil + bidi, Parent: "ME", Online: true},
+			{ID: "KID3", Name: "alice.x", Parent: evil + bidi},
+			{ID: "KID4", Name: "bob.y", Parent: "ME"},
+			{ID: "KID5", Name: "alice.rev.deep", Parent: "KID1"},
+			{ID: "KID6", Name: "alice.self", Parent: "KID6"},
+			{ID: "KID7", Name: "alice.gone", Parent: "NOBODY"},
 		})
 	})
 	mux.HandleFunc("GET /v1/rooms/{room}/messages", func(w http.ResponseWriter, r *http.Request) {
@@ -347,6 +365,9 @@ func hostileRelay(t *testing.T, key e2ee.Key, room string) *httptest.Server {
 			{Seq: 2, ID: evil + bidi, From: bidi + "BOB", Sealed: seal(bidi+"BOB", "", evil+bidi, api.Payload{Kind: evil, Text: "decrypts fine", ReplyTo: evil, Depth: 3}), CreatedAt: now},
 			{Seq: 3, ID: "OK1", From: "alice (you)" + bidi, To: "ME", Sealed: seal("alice (you)"+bidi, "ME", "OK1", api.Payload{Kind: api.KindReply, Text: "spoofed sender", ReplyTo: "OK0"}), CreatedAt: now},
 			{Seq: 4, ID: "feed", From: "ME", Sealed: seal("ME", "", "feed", api.Payload{Kind: api.KindAsk, Text: "id collision"}), CreatedAt: now},
+			{Seq: 5, ID: "K1", From: "KID1", Sealed: seal("KID1", "", "K1", api.Payload{Kind: api.KindReply, Text: "from a real session", ReplyTo: "feed"}), CreatedAt: now},
+			{Seq: 6, ID: "K3", From: "KID3", Sealed: seal("KID3", "", "K3", api.Payload{Kind: api.KindMessage, Text: "from a fake session"}), CreatedAt: now},
+			{Seq: 7, ID: "K4", From: "KID4", Sealed: seal("KID4", "", "K4", api.Payload{Kind: api.KindMessage, Text: "from a misnamed session"}), CreatedAt: now},
 		}})
 	})
 	mux.HandleFunc("POST /v1/rooms/{room}/messages", fail)
@@ -378,7 +399,9 @@ var (
 // markup lists the elements and attributes the templates write themselves.
 func markup(t *testing.T) (tags, attrs map[string]bool) {
 	t.Helper()
-	tags, attrs = map[string]bool{}, map[string]bool{"selected": true, "required": true, "readonly": true, "hidden": true, "autofocus": true, "defer": true, "data-reset": true, "": true}
+	tags, attrs = map[string]bool{}, map[string]bool{"selected": true, "required": true, "readonly": true, "hidden": true, "autofocus": true, "defer": true, "checked": true,
+		"data-copy": true, "data-close": true, "data-close-drawer": true, "data-drawer": true, "data-initial": true, "data-quote": true,
+		"data-grow": true, "data-machine-name": true, "data-machine-echo": true, "": true}
 	files, err := templateFiles.ReadDir("templates")
 	if err != nil {
 		t.Fatal(err)
@@ -396,11 +419,16 @@ func markup(t *testing.T) (tags, attrs map[string]bool) {
 }
 
 var htmxValue = map[string]*regexp.Regexp{
-	"hx-get":     regexp.MustCompile(`^/r/[A-Za-z0-9._-]+/(feed\?after=\d+|participants)$`),
-	"hx-post":    regexp.MustCompile(`^/r/[A-Za-z0-9._-]+/(send|invite|agents|revoke)$`),
-	"hx-trigger": regexp.MustCompile(`^(every 2s, ts-sent from:body|every 5s)$`),
+	"hx-get":     regexp.MustCompile(`^/r/[A-Za-z0-9._-]+/(feed\?after=\d+|participants|sessions)$`),
+	"hx-post":    regexp.MustCompile(`^/r/[A-Za-z0-9._-]+/(send|invite|revoke)$`),
+	"hx-trigger": regexp.MustCompile(`^(every 2s, ts-sent from:body|every 5s|every 3s)$`),
 	"src":        regexp.MustCompile(`^/static/(htmx-2\.0\.11\.min|ui)\.js$`),
-	"href":       regexp.MustCompile(`^(/[^:]*|#m-[A-Za-z0-9_-]+)$`),
+	"href":       regexp.MustCompile(`^(/[^:]*|#[A-Za-z][A-Za-z0-9_-]*|https://github\.com/t0uh33d/threadsplice/[A-Za-z0-9/._-]*)$`),
+	// ui.js looks these up by id or compares them; they carry relay ids only after validation.
+	"data-dialog": regexp.MustCompile(`^rm-[A-Za-z0-9_-]{1,64}$`),
+	"data-re":     regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`),
+	"data-g":      regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}\|[A-Za-z0-9_-]{0,64}$`),
+	"data-t":      regexp.MustCompile(`^-?\d+$`),
 }
 
 // inert fails unless body, rendered from hostile input, holds only the
@@ -451,11 +479,25 @@ func TestHostileRelay(t *testing.T) {
 	must(t, page, http.StatusOK, "decrypts fine", "spoofed sender", "Couldn't decrypt this message", "id collision", `id="m-OK1"`, `id="m-feed"`)
 	mustNot(t, page, "alice (you)", `id="m-X1`, `id="m-"`)
 	feed := check("feed", e.hx(http.MethodGet, "/r/alice/feed?after=0", nil))
-	must(t, feed, http.StatusOK, "unknown", `class="badge kind">message<`, "depth 3")
+	must(t, feed, http.StatusOK, "unknown", `class="msg k-message"`, "depth 3",
+		`id="m-feed" class="msg k-ask mine answered"`, "“id collision”", `<span class="on">on alice</span>`)
 	if strings.Contains(feed.body, `href="#m-X1`) {
 		t.Error("a hostile reply id became a link")
 	}
-	check("participants", e.hx(http.MethodGet, "/r/alice/participants", nil))
+	// Only the session member whose machine is real, and named for it, is shown as one.
+	if n := strings.Count(feed.body, `class="on"`); n != 1 || strings.Count(feed.body, `class="tag agent"`) != 1 {
+		t.Errorf("%d messages shown as from a session member, want 1", n)
+	}
+	members := check("participants", e.hx(http.MethodGet, "/r/alice/participants", nil))
+	must(t, members, http.StatusOK, `data-sessions="1"`, `data-count="10"`)
+	if strings.Count(members.body, `<ul class="kids"`) != 1 || !strings.Contains(members.body, `data-to="KID1" data-name="alice.rev"`) {
+		t.Errorf("session members grouped wrong:\n%s", members.body)
+	}
+	sessions := check("sessions", e.hx(http.MethodGet, "/r/alice/sessions", nil))
+	must(t, sessions, http.StatusOK, "alice.rev")
+	mustNot(t, sessions, "alice.x", "bob.y", "alice.self", "alice.gone", "alice.rev.deep", "invalid-name")
+	check("connect", e.get("/r/alice/connect"))
+	check("invites", e.get("/r/alice/invites"))
 	check("home", e.get("/"))
 	check("setup", e.get("/setup/claude?as=alice"))
 
@@ -515,7 +557,7 @@ func TestFlashStaysWithItsRoom(t *testing.T) {
 	}
 	create("second", "none")
 	r := e.get("/r/alice")
-	must(t, r, http.StatusOK, "<h1>second</h1>")
+	must(t, r, http.StatusOK, `<h1 id="room-title">second</h1>`)
 	mustNot(t, r, "invite-value")
 }
 

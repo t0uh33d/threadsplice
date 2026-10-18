@@ -1,7 +1,9 @@
 {{define "main"}}
-<section class="card">
-  <h1>{{.Title}}</h1>
-  <p>{{.Message}}</p>
-  <p><a href="/">Back to your rooms</a></p>
-</section>
+<div class="page narrow">
+  <section class="card problem">
+    <h1>{{.Title}}</h1>
+    <p>{{.Message}}</p>
+    <p><a class="btn" href="/">{{template "i-back"}}<span>Back to your rooms</span></a></p>
+  </section>
+</div>
 {{end}}

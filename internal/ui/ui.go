@@ -1,5 +1,5 @@
 // Package ui serves thread splice's local web UI: create and join rooms,
-// invite participants, and watch the live conversation between agents.
+// invite machines, connect agent sessions, and watch the live conversation.
 //
 // It runs on the user's machine, listens on loopback only, and acts as this
 // machine's identities: messages are decrypted here, and the plaintext goes
@@ -17,6 +17,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"html/template"
 	"log"
 	"net"
@@ -30,6 +31,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/t0uh33d/threadsplice/internal/api"
 	"github.com/t0uh33d/threadsplice/internal/client"
@@ -110,9 +112,11 @@ func New(opt Options) (http.Handler, error) {
 	mux.HandleFunc("GET /r/{alias}", s.room)
 	mux.HandleFunc("GET /r/{alias}/feed", s.feed)
 	mux.HandleFunc("GET /r/{alias}/participants", s.participants)
+	mux.HandleFunc("GET /r/{alias}/connect", s.connect)
+	mux.HandleFunc("GET /r/{alias}/sessions", s.sessions)
+	mux.HandleFunc("GET /r/{alias}/invites", s.invites)
 	mux.HandleFunc("POST /r/{alias}/send", s.send)
 	mux.HandleFunc("POST /r/{alias}/invite", s.invite)
-	mux.HandleFunc("POST /r/{alias}/agents", s.addAgent)
 	mux.HandleFunc("POST /r/{alias}/revoke", s.revoke)
 	mux.HandleFunc("GET /setup/{target}", s.setup)
 	mux.HandleFunc("GET /static/{file}", s.static)
@@ -266,17 +270,25 @@ func (s *server) badForm(w http.ResponseWriter, r *http.Request, err error) {
 
 // ---- rendering ----
 
-var funcs = template.FuncMap{"short": short, "ago": ago, "clock": clock, "kind": kindClass, "state": stateClass, "blocks": blocks}
+var funcs = template.FuncMap{"short": short, "ago": ago, "clock": clock, "kind": kindClass, "blocks": blocks, "agentName": agentName}
 
-// pages holds one template set per page; each defines "main" for the layout,
-// and room's also holds the fragments htmx swaps in.
-var pages = parsePages("home", "room", "setup", "problem")
+// pages holds one template set per page; each defines "main" for the layout.
+// room's also holds the fragments htmx swaps in, and the room's other pages
+// (connect, invites) reuse them, redefining "main".
+var pages = parsePages(map[string][]string{
+	"home": {"home"}, "room": {"room"}, "connect": {"room", "connect"}, "invites": {"room", "invites"},
+	"setup": {"setup"}, "problem": {"problem"},
+})
 
-func parsePages(names ...string) map[string]*template.Template {
+func parsePages(sets map[string][]string) map[string]*template.Template {
 	layout := template.Must(template.New("").Funcs(funcs).ParseFS(templateFiles, "templates/layout.html"))
 	m := map[string]*template.Template{}
-	for _, n := range names {
-		m[n] = template.Must(template.Must(layout.Clone()).ParseFS(templateFiles, "templates/"+n+".html"))
+	for name, files := range sets {
+		t := template.Must(layout.Clone())
+		for _, f := range files {
+			t = template.Must(t.ParseFS(templateFiles, "templates/"+f+".html"))
+		}
+		m[name] = t
 	}
 	return m
 }
@@ -307,7 +319,8 @@ func (s *server) fail(w http.ResponseWriter, r *http.Request, code int, msg stri
 // frame is what every full page shares: title, version and the sidebar.
 type frame struct {
 	Title, Version, Current string
-	Nav                     []navRoom
+	CurrentRoom             string // the current room's name, for the narrow room switcher
+	Nav                     []navGroup
 }
 
 type problemPage struct {
@@ -316,51 +329,80 @@ type problemPage struct {
 }
 
 func (s *server) frame(title, current string) frame {
-	return frame{Title: title, Version: s.version, Current: current, Nav: nav()}
+	f := frame{Title: title, Version: s.version, Current: current, Nav: nav()}
+	for _, g := range f.Nav {
+		for _, r := range g.Rooms {
+			if r.Alias == current && !r.Broken {
+				f.CurrentRoom = r.Room
+			}
+		}
+	}
+	return f
 }
 
+// navGroup is the rooms this machine is in on one relay.
+type navGroup struct {
+	Relay string // the relay's host, the group's caption
+	URL   string
+	Rooms []navRoom
+}
+
+// navRoom is a room this machine is in. A room joined more than once here
+// (before session members existed) lists each membership, with As set.
 type navRoom struct {
-	Name, Relay, URL string
-	Members          []navMember
+	Alias, Room, As string
+	Owner, Broken   bool
 }
 
-type navMember struct {
-	Alias, Name   string
-	Owner, Broken bool
-}
-
-// nav groups this machine's identities by room for the sidebar.
-func nav() []navRoom {
+// nav groups this machine's rooms by relay for the sidebar.
+func nav() []navGroup {
 	aliases, _ := client.List()
-	var rooms []navRoom
-	at := map[string]int{}
+	var ids []client.Identity
+	var broken []navRoom
+	in := map[string]int{} // relay and room -> memberships here
 	for _, a := range aliases {
 		id, err := client.Load(a)
-		key, m := id.Relay+"\x00"+id.RoomID, navMember{Alias: a, Name: id.Name, Owner: id.Owner}
 		if err != nil {
-			key, m = "\x00", navMember{Alias: a, Name: a, Broken: true}
-			id = client.Identity{RoomName: "Unreadable identities"}
+			broken = append(broken, navRoom{Alias: a, Room: a, Broken: true})
+			continue
 		}
-		i, ok := at[key]
-		if !ok {
-			i, at[key] = len(rooms), len(rooms)
-			rooms = append(rooms, navRoom{Name: id.RoomName, Relay: relayHost(id.Relay), URL: id.Relay})
-		}
-		rooms[i].Members = append(rooms[i].Members, m)
+		ids = append(ids, id)
+		in[id.Relay+"\x00"+id.RoomID]++
 	}
-	slices.SortFunc(rooms, func(a, b navRoom) int { return cmp.Or(cmp.Compare(a.Name, b.Name), cmp.Compare(a.Relay, b.Relay)) })
-	for _, r := range rooms { // owner first
-		slices.SortFunc(r.Members, func(a, b navMember) int {
-			switch {
-			case a.Owner && !b.Owner:
-				return -1
-			case b.Owner && !a.Owner:
+	var groups []navGroup
+	at := map[string]int{}
+	for _, id := range ids {
+		host := relayHost(id.Relay)
+		i, ok := at[host]
+		if !ok {
+			i, at[host] = len(groups), len(groups)
+			groups = append(groups, navGroup{Relay: host, URL: id.Relay})
+		}
+		r := navRoom{Alias: id.Alias, Room: id.RoomName, Owner: id.Owner}
+		if in[id.Relay+"\x00"+id.RoomID] > 1 {
+			r.As = id.Name
+		}
+		groups[i].Rooms = append(groups[i].Rooms, r)
+	}
+	slices.SortFunc(groups, func(a, b navGroup) int { return cmp.Compare(a.Relay, b.Relay) })
+	for _, g := range groups { // owner first within a room
+		slices.SortFunc(g.Rooms, func(a, b navRoom) int {
+			if c := cmp.Compare(a.Room, b.Room); c != 0 {
+				return c
+			}
+			if a.Owner != b.Owner {
+				if a.Owner {
+					return -1
+				}
 				return 1
 			}
-			return cmp.Compare(a.Name, b.Name)
+			return cmp.Compare(a.As, b.As)
 		})
 	}
-	return rooms
+	if broken != nil {
+		groups = append(groups, navGroup{Relay: "Unreadable on this machine", Rooms: broken})
+	}
+	return groups
 }
 
 func relayHost(raw string) string {
@@ -437,7 +479,26 @@ func blocks(s string) []block {
 	return out
 }
 
-// kindClass and stateClass map peer- and relay-supplied values to fixed CSS classes.
+// Open, Body and Close split a code block at its fence lines, so its Copy
+// button takes just the code. An unclosed block has no Close.
+func (b block) Open() string  { o, _, _ := b.parts(); return o }
+func (b block) Body() string  { _, x, _ := b.parts(); return x }
+func (b block) Close() string { _, _, c := b.parts(); return c }
+
+func (b block) parts() (open, body, close string) {
+	i := strings.IndexByte(b.Text, '\n')
+	if i < 0 {
+		return b.Text, "", ""
+	}
+	open, rest := b.Text[:i+1], b.Text[i+1:]
+	j := strings.LastIndexByte(strings.TrimSuffix(rest, "\n"), '\n') + 1
+	if strings.HasPrefix(strings.TrimLeft(rest[j:], " \t"), "```") {
+		return open, rest[:j], rest[j:]
+	}
+	return open, rest, ""
+}
+
+// kindClass maps a peer-supplied kind to a fixed CSS class.
 func kindClass(k string) string {
 	switch k {
 	case api.KindAsk, api.KindReply, api.KindMessage:
@@ -446,12 +507,47 @@ func kindClass(k string) string {
 	return "other"
 }
 
-func stateClass(s string) string {
-	switch s {
-	case "idle", "busy", "away":
-		return s
+// avatar returns a member's initials and one of eight colour classes, picked
+// by a stable hash of the name so a member keeps its colour everywhere. A
+// session member's initials come from its label: every session on "mac"
+// starting with M would tell them apart by colour alone.
+func avatar(name, machine string) (initials, class string) {
+	h := fnv.New32a()
+	h.Write([]byte(name))
+	class = "av-" + strconv.Itoa(int(h.Sum32()%8))
+	label := name
+	if machine != "" {
+		label = strings.TrimPrefix(name, machine+".")
 	}
-	return "other"
+	parts := strings.FieldsFunc(label, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
+	for _, p := range parts[:min(len(parts), 2)] {
+		initials += strings.ToUpper(string([]rune(p)[0]))
+	}
+	return cmp.Or(initials, "?"), class
+}
+
+// snippet is the start of a message, for a reply's "reply to" line.
+func snippet(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if r := []rune(s); len(r) > 60 {
+		return strings.TrimRightFunc(string(r[:60]), unicode.IsSpace) + "…"
+	}
+	return s
+}
+
+// agentName is a target's name as people know it.
+func agentName(target string) string {
+	switch target {
+	case "claude":
+		return "Claude Code"
+	case "codex":
+		return "Codex"
+	case "copilot":
+		return "Copilot CLI"
+	case "vscode":
+		return "VS Code"
+	}
+	return target
 }
 
 // ---- home: create and join ----
@@ -474,10 +570,32 @@ func ttlFor(v string) (time.Duration, bool) {
 	return ttls[i].Dur, true
 }
 
+// formErr is a form's error and the field it belongs to ("" for the whole
+// form), so the page can show it under that field.
+type formErr struct{ Err, Field string }
+
+// ErrFor is the error to show under field.
+func (f formErr) ErrFor(field string) string {
+	if f.Field == field {
+		return f.Err
+	}
+	return ""
+}
+
+// FormErr is an error that belongs to no single field.
+func (f formErr) FormErr() string { return f.ErrFor("") }
+
 // createForm and joinForm are what the forms re-render with. Neither holds
 // a secret: the admin token and the invite are never sent back.
-type createForm struct{ Relay, Room, Name, TTL, Err string }
-type joinForm struct{ Name, Err string }
+type createForm struct {
+	Relay, Room, Name, TTL string
+	formErr
+}
+
+type joinForm struct {
+	Name string
+	formErr
+}
 
 type homePage struct {
 	frame
@@ -487,42 +605,51 @@ type homePage struct {
 }
 
 func (s *server) home(w http.ResponseWriter, r *http.Request) {
-	s.renderHome(w, http.StatusOK, createForm{}, joinForm{})
+	s.renderHome(w, http.StatusOK, createForm{Name: client.DefaultMachineName()}, joinForm{Name: client.DefaultMachineName()})
 }
 
 func (s *server) renderHome(w http.ResponseWriter, code int, c createForm, j joinForm) {
 	p := homePage{frame: s.frame("Rooms", ""), Create: c, Join: j, TTLs: ttls}
+	if p.Nav == nil {
+		p.Title = "Welcome"
+	}
 	if p.Create.Relay == "" {
 		p.Create.Relay = os.Getenv("THREADSPLICE_RELAY")
 		if p.Create.Relay == "" && len(p.Nav) > 0 {
 			p.Create.Relay = p.Nav[0].URL
 		}
 	}
-	// The name field starts empty: every room member and the relay see the
-	// owner's name, so don't volunteer the OS login name.
 	p.Create.TTL = cmp.Or(p.Create.TTL, "24h")
 	s.render(w, code, "home", "layout", p)
 }
 
 // createRoom does what `threadsplice room create` does: the relay creates the
-// room, the room key is generated here, and the identity is saved locally.
+// room, the room key is generated here, and this machine's membership is saved.
 func (s *server) createRoom(w http.ResponseWriter, r *http.Request) {
 	f := createForm{Relay: strings.TrimRight(strings.TrimSpace(r.PostFormValue("relay")), "/"), Room: strings.TrimSpace(r.PostFormValue("room")),
 		Name: strings.TrimSpace(r.PostFormValue("name")), TTL: r.PostFormValue("ttl")}
 	admin := r.PostFormValue("admin") // used for this one request: never stored, logged or rendered
 	ttl, ttlOK := ttlFor(f.TTL)
 	switch {
-	case f.Relay == "" || f.Room == "" || f.Name == "" || admin == "":
-		f.Err = "Fill in every field."
-	case !api.ValidName(f.Room) || !api.ValidName(f.Name):
-		f.Err = nameRule
+	case f.Relay == "":
+		f.formErr = formErr{"Enter the relay's URL.", "relay"}
+	case f.Room == "":
+		f.formErr = formErr{"Enter a name for the room.", "room"}
+	case !api.ValidName(f.Room):
+		f.formErr = formErr{nameRule, "room"}
+	case f.Name == "":
+		f.formErr = formErr{"Enter a name for this machine.", "name"}
+	case !api.ValidName(f.Name):
+		f.formErr = formErr{nameRule, "name"}
+	case admin == "":
+		f.formErr = formErr{"Enter the relay's admin token.", "admin"}
 	case len(admin) < minAdmin:
-		f.Err = fmt.Sprintf("That isn't the relay's admin token: relays require at least %d characters.", minAdmin)
+		f.formErr = formErr{fmt.Sprintf("That isn't the relay's admin token: relays require at least %d characters.", minAdmin), "admin"}
 	case !ttlOK:
-		f.Err = "Choose how long the first invite stays valid."
+		f.formErr = formErr{"Choose how long the first invite stays valid.", "ttl"}
 	default:
 		if err := client.CheckRelayURL(f.Relay); err != nil {
-			f.Err = err.Error()
+			f.formErr = formErr{err.Error(), "relay"}
 		}
 	}
 	if f.Err == "" {
@@ -532,7 +659,7 @@ func (s *server) createRoom(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			key := e2ee.NewKey() // generated here; the relay never sees it
 			id := client.Identity{Relay: f.Relay, RoomID: m.RoomID, RoomName: m.RoomName, ParticipantID: m.ParticipantID,
-				Name: f.Name, Owner: true, Token: m.Token, RoomKey: key.String()}
+				Name: f.Name, Owner: true, Machine: true, Token: m.Token, RoomKey: key.String()}
 			if id, err = saveNew(id); err == nil {
 				if ttl > 0 {
 					inv, err := mintInvite(ctx, id, ttl)
@@ -548,9 +675,28 @@ func (s *server) createRoom(w http.ResponseWriter, r *http.Request) {
 			}
 			err = fmt.Errorf("the relay created the room, but it couldn't be saved on this machine: %w", err)
 		}
-		f.Err = redact(err.Error(), admin) // a relay must not be able to make this page echo the token back
+		// A relay must not be able to make this page echo the token back.
+		f.formErr = relayErr(redact(err.Error(), admin), err, map[int]string{
+			http.StatusUnauthorized: "admin", http.StatusForbidden: "admin"}, "relay")
+		if f.Field == "admin" {
+			f.Err += ". Use the THREADSPLICE_ADMIN_TOKEN the relay was started with."
+		}
 	}
-	s.renderHome(w, http.StatusUnprocessableEntity, f, joinForm{})
+	s.renderHome(w, http.StatusUnprocessableEntity, f, joinForm{Name: client.DefaultMachineName()})
+}
+
+// relayErr places a relay call's error: on the field fields names for its
+// HTTP status, on unreached (the relay URL or the invite) when the relay
+// couldn't be reached at all, else on the whole form.
+func relayErr(msg string, err error, fields map[int]string, unreached string) formErr {
+	var se *client.StatusError
+	switch {
+	case errors.As(err, &se):
+		return formErr{msg, fields[se.Code]}
+	case errors.Is(err, context.DeadlineExceeded) || errors.As(err, new(*url.Error)):
+		return formErr{"Couldn't reach the relay: " + msg, unreached}
+	}
+	return formErr{msg, ""}
 }
 
 // flashKey ties a first invite to its room as well as the local name, which
@@ -558,36 +704,54 @@ func (s *server) createRoom(w http.ResponseWriter, r *http.Request) {
 func flashKey(id client.Identity) string { return id.Alias + "\x00" + id.Relay + "\x00" + id.RoomID }
 
 // joinRoom does what `threadsplice join` does: redeem the invite token at the
-// relay, keep the room key from the invite here.
+// relay, keep the room key from the invite here. The default machine name
+// moves on to name-2 … name-9 when another machine has it.
 func (s *server) joinRoom(w http.ResponseWriter, r *http.Request) {
 	f := joinForm{Name: strings.TrimSpace(r.PostFormValue("name"))}
 	relayURL, token, key, err := client.ParseInvite(r.PostFormValue("invite"))
 	switch {
-	case !api.ValidName(f.Name):
-		f.Err = nameRule
 	case err != nil:
-		f.Err = err.Error()
+		f.formErr = formErr{err.Error(), "invite"}
+	case !api.ValidName(f.Name):
+		f.formErr = formErr{nameRule, "name"}
 	default:
 		if err := client.CheckRelayURL(relayURL); err != nil {
-			f.Err = err.Error()
+			f.formErr = formErr{err.Error(), "invite"}
 		}
 	}
 	if f.Err == "" {
 		ctx, cancel := relayCtx(r)
 		defer cancel()
-		m, err := client.New(relayURL, "").Join(ctx, token, f.Name) // the key stays local
+		names := []string{f.Name}
+		if f.Name == client.DefaultMachineName() {
+			for i := 2; i <= 9; i++ {
+				names = append(names, f.Name+"-"+strconv.Itoa(i))
+			}
+		}
+		var m api.Membership
+		var se *client.StatusError
+		name := f.Name
+		for _, name = range names {
+			m, err = client.New(relayURL, "").Join(ctx, token, name) // the key stays local
+			if !errors.As(err, &se) || se.Code != http.StatusConflict {
+				break
+			}
+		}
 		if err == nil {
 			id := client.Identity{Relay: relayURL, RoomID: m.RoomID, RoomName: m.RoomName, ParticipantID: m.ParticipantID,
-				Name: f.Name, Token: m.Token, RoomKey: key.String()}
+				Name: name, Machine: true, Token: m.Token, RoomKey: key.String()}
 			if id, err = saveNew(id); err == nil {
 				http.Redirect(w, r, "/r/"+id.Alias, http.StatusSeeOther)
 				return
 			}
 		}
-		f.Err = redact(err.Error(), token)
+		f.formErr = relayErr(redact(err.Error(), token), err, map[int]string{
+			http.StatusConflict: "name", http.StatusForbidden: "invite", http.StatusNotFound: "invite"}, "invite")
 	}
-	f.Err = strings.TrimRight(f.Err, ".") + ". Paste the invite again: it contains the room key, so this page never shows it back."
-	s.renderHome(w, http.StatusUnprocessableEntity, createForm{}, f)
+	if f.Field == "invite" {
+		f.Err = strings.TrimRight(f.Err, ".") + ". Paste the invite again: it contains the room key, so this page never shows it back."
+	}
+	s.renderHome(w, http.StatusUnprocessableEntity, createForm{Name: client.DefaultMachineName()}, f)
 }
 
 var saveMu sync.Mutex
@@ -618,37 +782,84 @@ func saveNew(id client.Identity) (client.Identity, error) {
 			return id, client.Save(id)
 		}
 	}
-	return id, errors.New("no free identity name on this machine: remove an unused identity first")
+	return id, errors.New("no free name on this machine for this membership: remove one this machine no longer uses")
 }
 
 // ---- setup and static files ----
 
 type setupPage struct {
 	frame
-	Target, Alias, Text, Exe, Home string
-	Targets, Aliases               []string
+	Target, Alias, Exe, Home string
+	Blocks                   []block
+	Targets, Aliases         []string
 }
 
-// setup shows what `threadsplice setup <target> -as <alias>` prints.
+// setup shows what `threadsplice setup <target> -as <alias>` prints, with a
+// Copy button on each command and config block.
 func (s *server) setup(w http.ResponseWriter, r *http.Request) {
 	target := r.PathValue("target")
 	if !slices.Contains(hooks.SetupTargets, target) {
 		s.fail(w, r, http.StatusNotFound, "Unknown agent. Setup covers: "+strings.Join(hooks.SetupTargets, ", ")+".")
 		return
 	}
-	p := setupPage{frame: s.frame("Connect an agent", ""), Target: target, Targets: hooks.SetupTargets}
+	p := setupPage{frame: s.frame("Set up "+agentName(target), ""), Target: target, Targets: hooks.SetupTargets}
 	p.Aliases, _ = client.List()
 	if as := r.URL.Query().Get("as"); as != "" {
 		if !client.ValidAlias(as) || !slices.Contains(p.Aliases, as) {
-			s.fail(w, r, http.StatusNotFound, "No such identity on this machine.")
+			s.fail(w, r, http.StatusNotFound, "This machine has no member by that name.")
 			return
 		}
 		p.Alias, p.Current = as, as
-		p.Text, _ = hooks.Setup(target, as)
+		text, _ := hooks.Setup(target, as)
+		p.Blocks = setupBlocks(text)
 		p.Exe, _ = os.Executable()
 		p.Home = os.Getenv("THREADSPLICE_HOME")
 	}
 	s.render(w, http.StatusOK, "setup", "layout", p)
+}
+
+// setupBlocks splits setup text into prose paragraphs and code blocks: runs
+// of lines indented four spaces or more, blank lines between them included.
+// Prose lines are hard-wrapped for a terminal, so a paragraph's lines join.
+func setupBlocks(text string) []block {
+	var out []block
+	var para, code []string
+	flush := func() {
+		if len(para) > 0 {
+			out = append(out, block{Text: strings.Join(para, " ")})
+			para = nil
+		}
+		for len(code) > 0 && code[len(code)-1] == "" {
+			code = code[:len(code)-1]
+		}
+		if len(code) > 0 {
+			out = append(out, block{Text: strings.Join(code, "\n"), Code: true})
+			code = nil
+		}
+	}
+	for line := range strings.Lines(text) {
+		line = strings.TrimRight(line, " \t\r\n")
+		switch {
+		case strings.HasPrefix(line, "    "):
+			if len(para) > 0 {
+				flush()
+			}
+			code = append(code, line[4:])
+		case line == "":
+			if len(code) > 0 {
+				code = append(code, "") // a blank line may sit inside a block
+			} else {
+				flush()
+			}
+		default:
+			if len(code) > 0 {
+				flush()
+			}
+			para = append(para, strings.TrimSpace(line))
+		}
+	}
+	flush()
+	return out
 }
 
 // staticTypes is fixed rather than mime.TypeByExtension: the Windows registry
@@ -670,7 +881,7 @@ func (s *server) static(w http.ResponseWriter, r *http.Request) {
 // favicon serves the header's mark, which is self-contained SVG.
 func (s *server) favicon(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "image/svg+xml")
-	pages["problem"].ExecuteTemplate(w, "mark", nil)
+	pages["problem"].ExecuteTemplate(w, "mark", "")
 }
 
 func relayCtx(r *http.Request) (context.Context, context.CancelFunc) {

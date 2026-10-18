@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -13,7 +14,6 @@ import (
 
 	"github.com/t0uh33d/threadsplice/internal/api"
 	"github.com/t0uh33d/threadsplice/internal/client"
-	"github.com/t0uh33d/threadsplice/internal/hooks"
 )
 
 // roomView is all a page may show about an identity: never its token or room key.
@@ -30,26 +30,33 @@ type roomPage struct {
 	frame
 	Room    roomView
 	Feed    feedView
-	Peers   peersView
+	Members peersView
 	Compose composeView
 	Flash   *inviteView
-	TTLs    []ttlOption
-	Targets []string
+	Steps   *checklist // nil once every step is done
+}
+
+// checklist is the room's getting-started steps, from real state; ui.js
+// ticks them off live as members and messages arrive.
+type checklist struct {
+	Room                        roomView
+	Members, Sessions, Messages bool
 }
 
 // agent loads the identity the {alias} path segment names and binds it to its
 // relay. On failure it has answered the request already. Unlike client.Load,
-// it never falls back to a default identity.
+// it never falls back to a default identity, and it only knows this machine's
+// top-level memberships: session members never get pages of their own.
 func (s *server) agent(w http.ResponseWriter, r *http.Request) (*client.Agent, bool) {
 	alias := r.PathValue("alias")
 	names, err := client.List()
 	if err != nil || !client.ValidAlias(alias) || !slices.Contains(names, alias) {
-		s.fail(w, r, http.StatusNotFound, "No such identity on this machine.")
+		s.fail(w, r, http.StatusNotFound, "This machine isn't in that room, or no longer is.")
 		return nil, false
 	}
 	a, err := client.OpenAgent(alias)
 	if err != nil {
-		s.fail(w, r, http.StatusInternalServerError, err.Error())
+		s.fail(w, r, http.StatusInternalServerError, "This machine's membership in that room can't be read: "+err.Error())
 		return nil, false
 	}
 	return a, true
@@ -85,9 +92,16 @@ func (s *server) room(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := relayCtx(r)
 	defer cancel()
 	v, rd := viewOf(a.ID), reader(a)
-	p := roomPage{frame: s.frame(v.Room, v.Alias), Room: v, Peers: peers(ctx, rd, v), TTLs: ttls, Targets: hooks.SetupTargets}
+	p := roomPage{frame: s.frame(v.Room, v.Alias), Room: v, Members: peers(ctx, rd, v)} // first: it warms rd's name cache
 	p.Feed = history(ctx, rd, v, 0)
-	p.Compose = composeView{Room: v, Peers: p.Peers.recipients()}
+	annotate(p.Feed.Rows, p.Members.byID)
+	p.Compose = composeView{Room: v, Peers: p.Members.recipients()}
+	if p.Members.Err == "" && p.Feed.Err == "" {
+		c := checklist{Room: v, Members: p.Members.Others > 0, Sessions: p.Members.Sessions > 0, Messages: len(p.Feed.Rows) > 0 || p.Feed.Skipped > 0}
+		if !c.Members || !c.Sessions || !c.Messages {
+			p.Steps = &c
+		}
+	}
 	if v.Owner {
 		s.mu.Lock()
 		if inv, ok := s.flash[flashKey(a.ID)]; ok {
@@ -103,9 +117,17 @@ func (s *server) room(w http.ResponseWriter, r *http.Request) {
 
 type row struct {
 	ID, From, To, Kind, Text, ReplyTo, Err string
-	At                                     time.Time
-	Depth                                  int
-	Mine, ToMe                             bool
+
+	Group        string // sender and recipient ids: consecutive rows with the same Group share one header
+	On           string // a session member's machine
+	Agent        bool   // sent by a session member
+	Initials, Av string // avatar
+	Quote        string // the start of the message ReplyTo answers, when the feed has it
+	Answered     bool   // an ask the feed has a reply to
+	Cont         bool   // continues the group above: no header of its own
+	At           time.Time
+	Depth        int
+	Mine, ToMe   bool
 }
 
 type feedView struct {
@@ -121,12 +143,17 @@ type feedView struct {
 // history after the cursor and keeps the tail. Add one if rooms grow large.
 const maxRows = 500
 
+// groupGap is how far apart a sender's messages may be and still share one
+// header (ui.js uses the same gap for rows that arrive later).
+const groupGap = 5 * time.Minute
+
 // history reads the room log after seq `after` through r (see reader) —
 // read-only, nothing is acknowledged, so agents' inboxes are untouched — and
 // keeps what v may see: the whole room for the owner, else what v may read
 // plus what v sent.
-func history(ctx context.Context, r *client.Agent, v roomView, after int64) feedView {
-	f := feedView{Room: v, Last: after}
+func history(ctx context.Context, r *client.Agent, v roomView, after int64) (f feedView) {
+	f = feedView{Room: v, Last: after}
+	defer func() { link(f.Rows) }()
 	for {
 		msgs, last, err := r.Log(ctx, f.Last, 0)
 		if err != nil {
@@ -154,12 +181,50 @@ func rowOf(m client.Message, me string) row {
 	if !relayID.MatchString(r.ID) {
 		r.ID = "" // no anchor or short id for an id the relay itself refuses
 	}
+	if relayID.MatchString(m.From) && (m.To == "" || relayID.MatchString(m.To)) {
+		r.Group = m.From + "|" + m.To
+	}
+	r.Initials, r.Av = avatar(r.From, "")
 	if m.Err != nil {
 		r.Err = m.Err.Error()
 		return r
 	}
 	r.Kind, r.Text, r.ReplyTo, r.Depth = cmp.Or(m.Kind, api.KindMessage), m.Text, m.ReplyTo, m.Depth
 	return r
+}
+
+// link groups consecutive rows per sender and ties replies to what they
+// answer, within one response; ui.js does the same across responses.
+func link(rows []row) {
+	at := map[string]int{}
+	for i := range rows {
+		r := &rows[i]
+		if r.ReplyTo != "" {
+			if j, ok := at[r.ReplyTo]; ok {
+				rows[j].Answered, r.Quote = true, snippet(rows[j].Text)
+			}
+		}
+		if r.ID != "" {
+			at[r.ID] = i
+		}
+		if i > 0 {
+			p := rows[i-1]
+			d := r.At.Sub(p.At)
+			r.Cont = r.Err == "" && p.Err == "" && r.Group != "" && r.Group == p.Group && d < groupGap && d > -groupGap
+		}
+	}
+}
+
+// annotate adds what the member list knows about each sender: whether it is
+// a session member, and on which machine.
+func annotate(rows []row, members map[string]peer) {
+	for i := range rows {
+		from, _, _ := strings.Cut(rows[i].Group, "|")
+		if p, ok := members[from]; ok && p.ParentName != "" {
+			rows[i].On, rows[i].Agent = p.ParentName, true
+			rows[i].Initials, rows[i].Av = avatar(rows[i].From, p.ParentName)
+		}
+	}
 }
 
 // shown is a participant label as pages show it. client.Agent keeps names to
@@ -188,44 +253,138 @@ func (s *server) feed(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := relayCtx(r)
 	defer cancel()
-	s.render(w, http.StatusOK, "room", "feed", history(ctx, reader(a), viewOf(a.ID), after))
+	v, rd := viewOf(a.ID), reader(a)
+	f := history(ctx, rd, v, after)
+	if len(f.Rows) > 0 { // most polls bring nothing, and then cost one relay call
+		annotate(f.Rows, peers(ctx, rd, v).byID)
+	}
+	s.render(w, http.StatusOK, "room", "feed", f)
 }
 
-// ---- participants ----
+// ---- members ----
 
 type peer struct {
-	ID, Name, State             string
-	Seen                        time.Time
-	Online, Owner, You, Revoked bool
+	ID, Name, State string
+	Parent          string // a session member's machine membership: its participant id
+	ParentName      string
+	Seen            time.Time
+	Online, Owner   bool
+	You, Revoked    bool
+	Initials, Av    string
+	Sessions        []peer // a machine's active session members
+	Page            string // the page's alias, for the remove form
+	CanRemove       bool
+}
+
+// Status is the word next to a member's dot: colour is never the only signal.
+func (p peer) Status() string {
+	switch {
+	case p.Revoked:
+		return "removed"
+	case p.Online && p.State != "":
+		return p.State
+	case p.Online:
+		return "online"
+	case p.State == "away":
+		return "away"
+	}
+	return "offline"
+}
+
+// Dot is the CSS class of a member's status dot.
+func (p peer) Dot() string {
+	switch p.Status() {
+	case "removed", "offline":
+		return "off"
+	case "busy", "away":
+		return p.Status()
+	}
+	return "on"
 }
 
 type peersView struct {
-	Room  roomView
-	Peers []peer
-	Err   string
+	Room     roomView
+	Machines []peer // active top-level members, this page's first, each with its session members
+	Removed  []peer
+	Count    int // active members
+	Others   int // active members besides this page's
+	Sessions int // active session members
+	byID     map[string]peer
+	Err      string
 }
 
+// peers lists the room's members, grouped by machine. The relay says which
+// members are sessions of which machine; it isn't trusted with that either,
+// so a Parent counts only when it names a top-level member of this room and
+// the session's name starts with that member's name and a dot.
 func peers(ctx context.Context, a *client.Agent, v roomView) peersView {
-	p := peersView{Room: v}
+	p := peersView{Room: v, byID: map[string]peer{}}
 	ps, err := a.Peers(ctx)
 	if err != nil {
-		p.Err = "Couldn't load participants: " + redact(err.Error(), a.ID.Token) + "."
+		p.Err = "Couldn't load members: " + redact(err.Error(), a.ID.Token) + "."
 		return p
 	}
+	top := map[string]api.Participant{}
 	for _, x := range ps {
-		p.Peers = append(p.Peers, peer{ID: x.ID, Name: shown(x.Name), State: x.State, Seen: x.LastSeen,
-			Online: x.Online, Owner: x.Owner, You: x.ID == v.PID, Revoked: x.Revoked})
+		if x.Parent == "" {
+			top[x.ID] = x
+		}
+	}
+	var all []peer
+	for _, x := range ps {
+		q := peer{ID: x.ID, Name: shown(x.Name), State: x.State, Seen: x.LastSeen, Online: x.Online, Owner: x.Owner,
+			You: x.ID == v.PID, Revoked: x.Revoked, Page: v.Alias}
+		if m, ok := top[x.Parent]; ok && x.Parent != x.ID && relayID.MatchString(x.Parent) && api.ValidName(m.Name) && strings.HasPrefix(x.Name, m.Name+".") {
+			q.Parent, q.ParentName = x.Parent, m.Name
+		}
+		q.Initials, q.Av = avatar(q.Name, q.ParentName)
+		q.CanRemove = v.Owner && !q.You && !q.Revoked && relayID.MatchString(q.ID)
+		p.byID[q.ID] = q
+		all = append(all, q)
+	}
+	// Machines in the relay's order, this page's first; sessions under theirs.
+	slices.SortStableFunc(all, func(a, b peer) int {
+		switch {
+		case a.You == b.You:
+			return 0
+		case a.You:
+			return -1
+		}
+		return 1
+	})
+	at := map[string]int{}
+	for _, q := range all {
+		if q.Revoked {
+			p.Removed = append(p.Removed, q)
+			continue
+		}
+		p.Count++
+		if !q.You {
+			p.Others++
+		}
+		if q.Parent != "" {
+			p.Sessions++
+			if i, ok := at[q.Parent]; ok {
+				p.Machines[i].Sessions = append(p.Machines[i].Sessions, q)
+				continue
+			}
+		}
+		if q.Parent == "" {
+			at[q.ID] = len(p.Machines)
+		}
+		p.Machines = append(p.Machines, q) // a session whose machine isn't listed (yet) stands alone
 	}
 	return p
 }
 
-// recipients are the participants a message can go to.
+// recipients are the members a message can go to: everyone active but this page's.
 func (p peersView) recipients() []peer {
 	var out []peer
-	for _, x := range p.Peers {
-		if !x.You && !x.Revoked {
-			out = append(out, x)
+	for _, m := range p.Machines {
+		if !m.You {
+			out = append(out, m)
 		}
+		out = append(out, m.Sessions...)
 	}
 	return out
 }
@@ -240,7 +399,8 @@ func (s *server) participants(w http.ResponseWriter, r *http.Request) {
 	s.render(w, http.StatusOK, "room", "participants", peers(ctx, reader(a), viewOf(a.ID)))
 }
 
-// revoke removes a participant (owner only) and answers with the refreshed panel.
+// revoke removes a member (owner only) and answers with the refreshed panel.
+// The relay removes a machine's session members with it.
 func (s *server) revoke(w http.ResponseWriter, r *http.Request) {
 	a, ok := s.agent(w, r)
 	if !ok {
@@ -251,17 +411,113 @@ func (s *server) revoke(w http.ResponseWriter, r *http.Request) {
 	code, msg, pid := http.StatusOK, "", r.PostFormValue("pid")
 	switch {
 	case !a.ID.Owner:
-		code, msg = http.StatusForbidden, "Only the room owner can revoke participants."
+		code, msg = http.StatusForbidden, "Only the room owner can remove members."
 	case pid == "" || pid == a.ID.ParticipantID:
-		code, msg = http.StatusUnprocessableEntity, "Choose another participant to revoke."
+		code, msg = http.StatusUnprocessableEntity, "Choose another member to remove."
 	default:
 		if err := a.Relay.Revoke(ctx, a.ID.RoomID, pid); err != nil {
-			code, msg = http.StatusBadGateway, "Not revoked: "+redact(err.Error(), a.ID.Token)
+			code, msg = http.StatusBadGateway, "Not removed: "+redact(err.Error(), a.ID.Token)
 		}
 	}
 	p := peers(ctx, a, viewOf(a.ID))
 	p.Err = cmp.Or(msg, p.Err)
 	s.render(w, code, "room", "participants", p)
+}
+
+// ---- connect an agent ----
+
+// claudeHooks is what `threadsplice setup claude` (no -as) has Claude Code
+// run: each session's hooks find its own member, or stay silent.
+const claudeHooks = `{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "threadsplice hook claude", "timeout": 10}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "threadsplice hook claude", "timeout": 10}]}],
+    "PostToolUse": [{"hooks": [{"type": "command", "command": "threadsplice hook claude", "timeout": 10}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "threadsplice hook claude", "timeout": 10}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "threadsplice hook claude", "timeout": 3}]}]
+  }
+}`
+
+type sessionsView struct {
+	Room     roomView
+	Sessions []peer
+	Err      string
+}
+
+// sessionsOf picks the page's own session members out of the member list.
+func sessionsOf(p peersView) sessionsView {
+	sv := sessionsView{Room: p.Room, Err: p.Err}
+	for _, m := range p.Machines {
+		if m.You {
+			for _, k := range m.Sessions {
+				k.CanRemove = false
+				sv.Sessions = append(sv.Sessions, k)
+			}
+		}
+	}
+	return sv
+}
+
+type connectPage struct {
+	frame
+	Room          roomView
+	Sessions      sessionsView
+	Phrase, Hooks string
+	NameRoom      bool // this machine is in several rooms, so the phrase names this one
+	Exe, Home     string
+	Targets       []string // agents that join with a fixed member instead
+}
+
+// connect shows how a Claude Code session on this machine joins the room:
+// register the MCP server once, add the hooks, then ask in the chat.
+func (s *server) connect(w http.ResponseWriter, r *http.Request) {
+	a, ok := s.agent(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := relayCtx(r)
+	defer cancel()
+	v := viewOf(a.ID)
+	p := connectPage{frame: s.frame("Connect an agent · "+v.Room, v.Alias), Room: v, Hooks: claudeHooks,
+		Sessions: sessionsOf(peers(ctx, reader(a), v)), Targets: []string{"codex", "copilot", "vscode"}}
+	// The user pastes the phrase into a Claude chat as their own words, and
+	// the room name came from the relay: it goes in only if it's a valid name.
+	p.NameRoom = machines() > 1 && api.ValidName(v.Room)
+	p.Phrase = "join the thread splice room as reviewer"
+	if p.NameRoom {
+		p.Phrase = "join the thread splice room " + v.Room + " as reviewer"
+	}
+	p.Exe, _ = os.Executable()
+	p.Home = os.Getenv("THREADSPLICE_HOME")
+	s.render(w, http.StatusOK, "connect", "layout", p)
+}
+
+// machines counts the memberships a session's join could pick from, as the
+// join tool does: the machine memberships, or every top-level one when none
+// is marked (files from before session members).
+func machines() int {
+	names, _ := client.List()
+	all, marked := 0, 0
+	for _, n := range names {
+		if id, err := client.Load(n); err == nil {
+			all++
+			if id.Machine {
+				marked++
+			}
+		}
+	}
+	return cmp.Or(marked, all)
+}
+
+// sessions answers the Connect view's poller: this machine's session members.
+func (s *server) sessions(w http.ResponseWriter, r *http.Request) {
+	a, ok := s.agent(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := relayCtx(r)
+	defer cancel()
+	s.render(w, http.StatusOK, "connect", "sessions", sessionsOf(peers(ctx, reader(a), viewOf(a.ID))))
 }
 
 // ---- compose ----
@@ -282,7 +538,7 @@ func (s *server) send(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := relayCtx(r)
 	defer cancel()
-	c := composeView{Room: viewOf(a.ID), To: r.PostFormValue("to"), Kind: r.PostFormValue("kind"),
+	c := composeView{Room: viewOf(a.ID), To: r.PostFormValue("to"), Kind: cmp.Or(r.PostFormValue("kind"), api.KindMessage),
 		Text: strings.ReplaceAll(r.PostFormValue("text"), "\r\n", "\n")}
 	code := http.StatusOK
 	switch {
@@ -296,7 +552,7 @@ func (s *server) send(w http.ResponseWriter, r *http.Request) {
 		if _, err := a.Send(ctx, c.To, api.Payload{Kind: c.Kind, Text: c.Text}); err != nil {
 			code, c.Err = http.StatusBadGateway, "Not sent: "+redact(err.Error(), a.ID.Token)
 		} else {
-			c.Text, c.Sent = "", true
+			c.Text, c.Kind, c.Sent = "", "", true // an ask is one message: the toggle starts over
 			w.Header().Set("HX-Trigger", "ts-sent")
 		}
 	}
@@ -304,9 +560,12 @@ func (s *server) send(w http.ResponseWriter, r *http.Request) {
 	s.render(w, code, "room", "compose", c)
 }
 
-// ---- owner tools ----
+// ---- invites ----
 
-type inviteView struct{ Invite, Command, Expires, Err string }
+type inviteView struct {
+	Invite, Expires, Err string
+	Focus                bool // just created on request: its Copy button takes focus
+}
 
 // mintInvite does what `threadsplice invite` does: the relay mints a
 // single-use token and the room key is appended here.
@@ -319,15 +578,39 @@ func mintInvite(ctx context.Context, id client.Identity, ttl time.Duration) (inv
 	if err != nil {
 		return inviteView{}, err
 	}
-	if !tokenRe.MatchString(inv.Token) { // it ends up in a command line the user pastes
+	if !tokenRe.MatchString(inv.Token) { // it ends up pasted into a terminal
 		return inviteView{}, errors.New("the relay returned a malformed invite token")
 	}
-	s := client.FormatInvite(id.Relay, inv.Token, key)
-	return inviteView{Invite: s, Command: "threadsplice join -as <name> " + shellQuote(s),
-		Expires: inv.ExpiresAt.Local().Format("Mon Jan 2 15:04")}, nil
+	return inviteView{Invite: client.FormatInvite(id.Relay, inv.Token, key), Expires: inv.ExpiresAt.Local().Format("Mon Jan 2 15:04")}, nil
 }
 
-func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+type invitesPage struct {
+	frame
+	Room  roomView
+	TTLs  []ttlOption
+	Owner string // the owner's name, for the others' explanation
+}
+
+// invites is the Invite view: the owner creates invites for other machines;
+// anyone else learns who can.
+func (s *server) invites(w http.ResponseWriter, r *http.Request) {
+	a, ok := s.agent(w, r)
+	if !ok {
+		return
+	}
+	v := viewOf(a.ID)
+	p := invitesPage{frame: s.frame("Invite a machine · "+v.Room, v.Alias), Room: v, TTLs: ttls}
+	if !v.Owner {
+		ctx, cancel := relayCtx(r)
+		defer cancel()
+		for _, m := range peers(ctx, reader(a), v).Machines {
+			if m.Owner {
+				p.Owner = m.Name
+			}
+		}
+	}
+	s.render(w, http.StatusOK, "invites", "layout", p)
+}
 
 func (s *server) invite(w http.ResponseWriter, r *http.Request) {
 	a, ok := s.agent(w, r)
@@ -350,62 +633,6 @@ func (s *server) invite(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, http.StatusBadGateway, "No invite: "+redact(err.Error(), a.ID.Token))
 		return
 	}
+	inv.Focus = true
 	s.render(w, http.StatusOK, "room", "invite", inv)
-}
-
-type agentView struct {
-	Name, Alias string
-	Targets     []string
-	Frame       frame // refreshes the sidebar
-}
-
-// addAgent creates an invite and redeems it here as a new identity, exactly
-// as `threadsplice join` would on this machine.
-func (s *server) addAgent(w http.ResponseWriter, r *http.Request) {
-	a, ok := s.agent(w, r)
-	if !ok {
-		return
-	}
-	name := strings.TrimSpace(r.PostFormValue("name"))
-	switch {
-	case !a.ID.Owner:
-		s.fail(w, r, http.StatusForbidden, "Only the room owner can add participants.")
-		return
-	case !api.ValidName(name):
-		s.fail(w, r, http.StatusUnprocessableEntity, nameRule)
-		return
-	}
-	if err := client.CheckRelayURL(a.ID.Relay); err != nil {
-		s.fail(w, r, http.StatusUnprocessableEntity, err.Error())
-		return
-	}
-	ctx, cancel := relayCtx(r)
-	defer cancel()
-	ps, err := a.Peers(ctx)
-	if err != nil {
-		s.fail(w, r, http.StatusBadGateway, "Couldn't reach the relay: "+redact(err.Error(), a.ID.Token))
-		return
-	}
-	if slices.ContainsFunc(ps, func(p api.Participant) bool { return p.Name == name }) {
-		s.fail(w, r, http.StatusUnprocessableEntity, fmt.Sprintf("%q is already taken in this room.", name))
-		return
-	}
-	// Redeemed at once, so it only needs to live a minute.
-	inv, err := a.Relay.CreateInvite(ctx, a.ID.RoomID, time.Minute)
-	if err != nil {
-		s.fail(w, r, http.StatusBadGateway, "No invite: "+redact(err.Error(), a.ID.Token))
-		return
-	}
-	m, err := client.New(a.ID.Relay, "").Join(ctx, inv.Token, name)
-	if err != nil {
-		s.fail(w, r, http.StatusBadGateway, "Couldn't join: "+redact(err.Error(), a.ID.Token, inv.Token))
-		return
-	}
-	id, err := saveNew(client.Identity{Relay: a.ID.Relay, RoomID: m.RoomID, RoomName: m.RoomName, ParticipantID: m.ParticipantID,
-		Name: name, Token: m.Token, RoomKey: a.ID.RoomKey})
-	if err != nil {
-		s.fail(w, r, http.StatusInternalServerError, fmt.Sprintf("%s joined the room, but its identity couldn't be saved: %v", name, err))
-		return
-	}
-	s.render(w, http.StatusOK, "room", "agent", agentView{Name: name, Alias: id.Alias, Targets: hooks.SetupTargets, Frame: s.frame("", a.ID.Alias)})
 }
