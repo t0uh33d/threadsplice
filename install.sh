@@ -17,6 +17,8 @@
 set -eu
 
 repo=t0uh33d/threadsplice
+# Only an attestation signed by this workflow counts, not any workflow in the repo.
+workflow=github.com/$repo/.github/workflows/release.yml
 
 say() { printf '%s\n' "$@"; }
 
@@ -49,6 +51,12 @@ sha256() {
 	fi
 }
 
+# is_sha256 S succeeds if S is 64 lowercase hex digits, as sha256sum prints them.
+is_sha256() {
+	case $1 in *[!0123456789abcdef]*) return 1 ;; esac
+	[ "${#1}" -eq 64 ]
+}
+
 # main runs from the last line, so a download cut short runs nothing.
 main() {
 	join=false
@@ -61,7 +69,7 @@ main() {
 	case $(uname -s) in
 	Darwin) os=darwin ;;
 	Linux) os=linux ;;
-	*) die "this installer is for macOS and Linux. On Windows, use WSL, or download the Windows zip from https://github.com/$repo/releases" ;;
+	*) die "this installer is for macOS and Linux, not $(uname -s). On Windows, use WSL, or download the Windows zip from https://github.com/$repo/releases" ;;
 	esac
 	case $(uname -m) in
 	x86_64 | amd64) arch=amd64 ;;
@@ -80,12 +88,20 @@ main() {
 	v[0-9]*) url=$base/download/$version ;;
 	*) die "THREADSPLICE_VERSION must be a release tag such as v0.1.0, or latest" ;;
 	esac
+	# A typo such as "true" must not quietly turn the requirement off.
+	case ${THREADSPLICE_REQUIRE_ATTESTATION:-0} in
+	0) require=false ;;
+	1) require=true ;;
+	*) die "THREADSPLICE_REQUIRE_ATTESTATION must be 1 or 0" ;;
+	esac
 	dir=${THREADSPLICE_INSTALL_DIR:-$HOME/.local/bin}
+	case $dir in /*) ;; *) dir=$PWD/$dir ;; esac # the PATH line needs it absolute
 	bin=$dir/threadsplice
-	new=$dir/.threadsplice.$$ # the new binary until it's renamed into place
+	[ ! -d "$bin" ] || die "$bin is a directory"
 
-	tmp=$(mktemp -d)
-	trap 'rm -rf "$tmp"; rm -f "$new"' EXIT
+	new= # the new binary, beside the old one until it's renamed over it
+	tmp=$(mktemp -d) || die "could not create a temporary directory"
+	trap 'rm -rf "$tmp"; [ -z "$new" ] || rm -f "$new"' EXIT
 	trap 'exit 1' HUP INT TERM
 
 	archive=threadsplice_${os}_${arch}.tar.gz
@@ -93,41 +109,56 @@ main() {
 	fetch "$url/$archive" >"$tmp/$archive" || die "could not download $url/$archive"
 	fetch "$url/SHA256SUMS" >"$tmp/SHA256SUMS" || die "could not download $url/SHA256SUMS"
 
-	# Fail closed: a missing entry stops here, and so does a different hash.
+	# Fail closed: a missing entry stops here, and so do a malformed hash (an
+	# error page served in place of SHA256SUMS, say) and a different one.
 	# Lines read "<hex>  <file>", or "<hex> *<file>" in binary mode.
 	want=$(awk -v f="$archive" '$2 == f || $2 == "*" f { print $1; exit }' "$tmp/SHA256SUMS")
 	[ -n "$want" ] || die "SHA256SUMS has no entry for $archive"
+	is_sha256 "$want" || die "SHA256SUMS's entry for $archive isn't a SHA-256"
 	got=$(sha256 "$tmp/$archive")
+	is_sha256 "$got" || die "could not compute the SHA-256 of $archive"
 	[ "$got" = "$want" ] || die "checksum mismatch for $archive: SHA256SUMS says $want, the download is $got"
 	say "Checksum OK."
 
 	# The checksum shows the archive matches SHA256SUMS. The attestation shows
 	# that this repository's release workflow built it.
-	require=${THREADSPLICE_REQUIRE_ATTESTATION:-0}
 	if ! command -v gh >/dev/null 2>&1 || ! gh auth status --hostname github.com >/dev/null 2>&1; then
-		[ "$require" != 1 ] || die "THREADSPLICE_REQUIRE_ATTESTATION=1 needs gh, installed and logged in"
+		[ "$require" = false ] || die "THREADSPLICE_REQUIRE_ATTESTATION=1 needs gh, installed and logged in"
 		say "Note: the build attestation wasn't checked; that needs gh, installed and logged in."
-	elif out=$(gh attestation verify "$tmp/$archive" --repo "$repo" 2>&1); then
+	elif out=$(gh attestation verify "$tmp/$archive" --repo "$repo" --signer-workflow "$workflow" 2>&1); then
 		say "Attestation OK."
-	elif [ "$require" = 1 ]; then
+	elif [ "$require" = true ]; then
 		die "gh attestation verify failed: $out"
 	else
 		say "Note: gh attestation verify failed, so only the checksum was checked:" "$out"
 	fi
 
 	tar -xzf "$tmp/$archive" -C "$tmp" threadsplice || die "could not unpack $archive"
-	mkdir -p "$dir"
-	# Copy beside the old binary, then rename over it. The rename is atomic, and
-	# a threadsplice that's running (an MCP server, say) keeps its old file.
+	mkdir -p "$dir" || die "could not create $dir; set THREADSPLICE_INSTALL_DIR to a directory you can write to"
+	# Stage the binary beside the old one, in a file mktemp has just created, so
+	# a link planted there can't redirect the copy. It has to run before the
+	# rename, so a build that can't run here leaves the old binary alone. The
+	# rename is atomic, and a threadsplice that's running (an MCP server, say)
+	# keeps its old file.
+	new=$(mktemp "$dir/.threadsplice.XXXXXX") || die "could not write to $dir; set THREADSPLICE_INSTALL_DIR to a directory you can write to"
 	cp "$tmp/threadsplice" "$new"
 	chmod 755 "$new"
+	v=$("$new" version) || die "the downloaded threadsplice doesn't run on this machine; $bin is unchanged"
 	mv -f "$new" "$bin"
-	v=$("$bin" version) || die "installed $bin, but it doesn't run"
+	new=
 	say "Installed $v to $bin"
 
 	cmd=$bin
 	case :$PATH: in
-	*:"$dir":*) cmd=threadsplice ;;
+	*:"$dir":*)
+		# An older copy earlier on PATH (from go install, say) would run instead.
+		found=$(command -v threadsplice) || found=$bin
+		if [ "$found" = "$bin" ]; then
+			cmd=threadsplice
+		else
+			say "" "Note: $found comes first on your PATH, so plain threadsplice runs that one, not this install."
+		fi
+		;;
 	*) say "" "$dir isn't on your PATH. To add it, put this line in your shell's startup file (~/.zshrc, ~/.bashrc):" "  export PATH=\"$dir:\$PATH\"" ;;
 	esac
 	say "" "Next steps:" \

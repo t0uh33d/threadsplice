@@ -47,9 +47,14 @@ jobs:
           export THREADSPLICE_DOWNLOAD_BASE="file://$PWD/dist" THREADSPLICE_VERSION=v0.0.0-test THREADSPLICE_INSTALL_DIR="$RUNNER_TEMP/bin"
           sh install.sh
           "$RUNNER_TEMP/bin/threadsplice" version
+          # It must refuse a tampered archive, and an error page served as SHA256SUMS.
           printf x >> "$rel/$name.tar.gz"
           if sh install.sh 2> "$RUNNER_TEMP/tampered.log"; then echo "install.sh accepted a tampered archive"; exit 1; fi
           grep 'checksum mismatch' "$RUNNER_TEMP/tampered.log"
+          echo '<!DOCTYPE html><title>Not Found</title>' > "$rel/SHA256SUMS"
+          if sh install.sh 2> "$RUNNER_TEMP/html.log"; then echo "install.sh accepted an error page as SHA256SUMS"; exit 1; fi
+          grep 'no entry' "$RUNNER_TEMP/html.log"
+          "$RUNNER_TEMP/bin/threadsplice" version # the refused installs left it in place
   vuln:
     runs-on: ubuntu-latest
     steps:
