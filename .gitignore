@@ -1,0 +1,8 @@
+/threadsplice
+/dist/
+*.db
+*.db-shm
+*.db-wal
+deploy/.env
+.vscode/
+context.md

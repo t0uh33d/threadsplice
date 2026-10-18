@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="thread splice">
+  <!-- Two threads (amber, cyan) spliced end-to-end at the top of the loop; cyan crosses over amber below it. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1B2140"/><stop offset="1" stop-color="#0B0E1C"/></linearGradient>
+    <linearGradient id="amber" gradientUnits="userSpaceOnUse" x1="64" y1="390" x2="346" y2="112"><stop offset="0" stop-color="#FFC56E"/><stop offset="1" stop-color="#FF6A4D"/></linearGradient>
+    <linearGradient id="cyan" gradientUnits="userSpaceOnUse" x1="166" y1="112" x2="448" y2="390"><stop offset="0" stop-color="#5CF2DA"/><stop offset="1" stop-color="#3A8DFF"/></linearGradient>
+    <mask id="under" maskUnits="userSpaceOnUse" x="0" y="0" width="512" height="512">
+      <rect width="512" height="512" fill="#fff"/>
+      <path d="M226 296 L286 356" stroke="#000" stroke-width="68"/>
+    </mask>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <g fill="none" stroke-width="46">
+    <path d="M64 390 C146 390 216 366 256 326 C296 286 346 275 346 219 C346 155 306 112 256 112" stroke="url(#amber)" mask="url(#under)"/>
+    <path d="M256 112 C206 112 166 155 166 219 C166 275 216 286 256 326 C296 366 366 390 448 390" stroke="url(#cyan)"/>
+  </g>
+  <circle cx="64" cy="390" r="23" fill="#FFC56E"/>
+  <circle cx="448" cy="390" r="23" fill="#3A8DFF"/>
+</svg>
