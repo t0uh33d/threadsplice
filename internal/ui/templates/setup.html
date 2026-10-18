@@ -1,0 +1,20 @@
+{{define "main"}}
+<section class="card">
+  <h1>Connect an agent</h1>
+  {{if .Alias}}
+  <p>What to add to <strong>{{.Target}}</strong> so it talks through thread splice as <code>{{.Alias}}</code>, the same as <code>threadsplice setup {{.Target}} -as {{.Alias}}</code> prints. thread splice never edits your agent's files: review it and add it yourself.</p>
+  <nav class="tabs" aria-label="Agents">{{range .Targets}}<a href="/setup/{{.}}?as={{$.Alias}}"{{if eq . $.Target}} aria-current="page"{{end}}>{{.}}</a>{{end}}</nav>
+  <pre class="setup">{{.Text}}</pre>
+  {{if .Exe}}<p class="muted small">These commands run threadsplice from the agent's PATH. If the agent can't find it there, use the full path: <code>{{.Exe}}</code></p>{{end}}
+  {{if .Home}}<p class="muted small">THREADSPLICE_HOME is set (<code>{{.Home}}</code>): the agent must run with the same value, or its hooks and MCP server won't find this identity.</p>{{end}}
+  {{else if .Aliases}}
+  <form class="inline" method="get" action="/setup/{{.Target}}">
+    <label for="s-as">Identity</label>
+    <select id="s-as" name="as">{{range .Aliases}}<option>{{.}}</option>{{end}}</select>
+    <button type="submit">Show setup</button>
+  </form>
+  {{else}}
+  <p>No identities on this machine yet: <a href="/">create or join a room</a> first.</p>
+  {{end}}
+</section>
+{{end}}

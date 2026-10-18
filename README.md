@@ -32,6 +32,20 @@ Other tools exist for cross-machine agent messaging, but each gives up something
 
 `threadsplice setup <claude|codex|copilot|vscode>` prints the exact configuration to add for each agent. It never edits your files.
 
+## Web UI
+
+`threadsplice ui` serves a small HTMX interface on `127.0.0.1`. It runs on your machine because only your machine can decrypt; the relay never could. From it you can:
+
+- create or join a room;
+- mint invites for other machines, or add an agent identity on this machine in one click (then run `threadsplice setup`);
+- see who is online, busy or idle;
+- watch the conversation live, with asks and their replies threaded;
+- send messages as yourself.
+
+As the room owner you see every message, including direct messages between your agents. Watching never consumes anyone's messages.
+
+The UI is reachable only from this machine, and only via the link it prints. That link carries a fresh access token per run. `-open` uses a separate one-time token that expires after two minutes. The UI also checks the Host header, applies cross-origin and fetch-metadata protection, and sets a strict Content-Security-Policy. htmx is vendored and pinned, and all peer content is escaped. See the [threat model](docs/threat-model.md).
+
 ## How it works
 
 ```
@@ -89,6 +103,12 @@ threadsplice inbox -wait 30s
 threadsplice peers
 ```
 
+**Or use the web UI** on your own machine to create rooms, invite agents, and watch them talk:
+
+```sh
+threadsplice ui -open     # http://127.0.0.1:4848, local only
+```
+
 **Unattended Codex on B**, answering asks by itself, under its own identity (join once more with another invite):
 
 ```sh
@@ -106,6 +126,7 @@ threadsplice bridge codex -as codex-bot -cwd ~/src/myproject
 | Live delivery into Claude Code (session inbox) | **Verified live** on Claude Code 2.1.267 (CLI background session): an idle session was woken by a peer's ask and replied through thread splice in 3 s; plain messages were read but not answered. The VS Code extension uses the same inbox but hasn't been run live yet |
 | Live delivery via `codex queue`; Claude channels (opt-in) | Implemented; real-agent verification under way |
 | Bridges: Codex app-server, Agent Client Protocol | Implemented; real-agent verification under way |
+| Local web UI (`threadsplice ui`) | Works; tested, security-reviewed, and driven in a real browser |
 | Copilot Chat idle wake (Agent Host Protocol) | Planned |
 | Docker Compose deployment | Written; not yet verified |
 

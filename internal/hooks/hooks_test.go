@@ -35,7 +35,6 @@ func room(t *testing.T) *client.Agent {
 	t.Setenv("THREADSPLICE_HOME", t.TempDir())
 	t.Setenv("THREADSPLICE_AS", "")
 	t.Setenv("CLAUDE_CODE_MESSAGING_SOCKET", "")
-	t.Setenv("CLAUDE_PID", "")
 	ctx := context.Background()
 	rs, err := relay.New(relay.Config{DBPath: filepath.Join(t.TempDir(), "r.db"), AdminToken: admin, Log: slog.New(slog.DiscardHandler)})
 	if err != nil {
@@ -50,7 +49,7 @@ func room(t *testing.T) *client.Agent {
 	key := e2ee.NewKey().String()
 	alice := client.Identity{Alias: "alice", Relay: ts.URL, RoomID: m.RoomID, RoomName: "proj", ParticipantID: m.ParticipantID,
 		Name: "alice", Owner: true, Token: m.Token, RoomKey: key}
-	if err := client.Save(alice, false); err != nil {
+	if err := client.Save(alice); err != nil {
 		t.Fatal(err)
 	}
 	inv, err := client.New(ts.URL, m.Token).CreateInvite(ctx, m.RoomID, time.Hour)
@@ -234,7 +233,6 @@ const (
 func TestClaude(t *testing.T) {
 	bob := room(t)
 	t.Setenv("CLAUDE_CODE_MESSAGING_SOCKET", "/tmp/cc-socks/4242.sock")
-	t.Setenv("CLAUDE_PID", "4242")
 	play(t, bob, "claude", []step{
 		{name: "start", in: claudeStart, want: specificJSON("SessionStart", welcomeText(0)), state: "idle"},
 		{name: "prompt, nothing waiting", in: claudePrompt, want: "", state: "busy"},
@@ -249,7 +247,7 @@ func TestClaude(t *testing.T) {
 		{name: "stop after reading", read: true, in: claudeStop, want: "", state: "idle"},
 		{name: "end", in: claudeEnd, want: "", state: "away"},
 	})
-	want := client.SessionInfo{Agent: "claude", SessionID: "cc-1", Socket: "/tmp/cc-socks/4242.sock", Cwd: "/work/proj", PID: 4242}
+	want := client.SessionInfo{Agent: "claude", SessionID: "cc-1", Socket: "/tmp/cc-socks/4242.sock"}
 	if got := session(t); got != want {
 		t.Errorf("session = %+v, want %+v", got, want)
 	}
@@ -274,7 +272,6 @@ func TestClaude(t *testing.T) {
 func TestCodex(t *testing.T) {
 	bob := room(t)
 	t.Setenv("CLAUDE_CODE_MESSAGING_SOCKET", "/tmp/cc-socks/1.sock") // Claude Code's, not Codex's
-	t.Setenv("CLAUDE_PID", "1")
 	play(t, bob, "codex", []step{
 		{name: "start, 1 waiting", send: 1, in: codexStart, want: specificJSON("SessionStart", welcomeText(1)), state: "idle"},
 		{name: "prompt", in: codexPrompt, want: specificJSON("UserPromptSubmit", waitingText(1)), state: "busy"},
@@ -282,7 +279,7 @@ func TestCodex(t *testing.T) {
 		{name: "stop after a block", in: codexStopAgain, want: "", state: "idle"},
 		{name: "end", in: codexSessionEnd, want: "", state: "away"},
 	})
-	want := client.SessionInfo{Agent: "codex", SessionID: codexThread, Cwd: "/srv/b"}
+	want := client.SessionInfo{Agent: "codex", SessionID: codexThread}
 	if got := session(t); got != want {
 		t.Errorf("session = %+v, want %+v", got, want)
 	}
@@ -299,7 +296,7 @@ func TestCopilot(t *testing.T) {
 		{name: "stop after a block", event: "agentStop", in: copilotStopAgain, want: "", state: "idle"},
 		{name: "end", event: "sessionEnd", in: copilotEnd, want: "", state: "away"},
 	})
-	want := client.SessionInfo{Agent: "copilot", SessionID: "cp-1", Cwd: "/work/proj"}
+	want := client.SessionInfo{Agent: "copilot", SessionID: "cp-1"}
 	if got := session(t); got != want {
 		t.Errorf("session = %+v, want %+v", got, want)
 	}
@@ -312,11 +309,7 @@ func TestCopilotInVSCode(t *testing.T) {
 		{name: "tool call", send: 1, event: "postToolUse", in: vscodeTool, want: specificJSON("PostToolUse", waitingText(2)), state: "busy"},
 		{name: "stop", event: "agentStop", in: vscodeStop, want: vscodeBlockJSON(2), state: "busy"},
 	})
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := client.SessionInfo{Agent: "copilot", SessionID: "vs-1", Cwd: wd} // VS Code may omit cwd
+	want := client.SessionInfo{Agent: "copilot", SessionID: "vs-1"}
 	if got := session(t); got != want {
 		t.Errorf("session = %+v, want %+v", got, want)
 	}
@@ -422,7 +415,7 @@ func saveIdentity(t *testing.T, base string) {
 	t.Setenv("THREADSPLICE_AS", "")
 	id := client.Identity{Alias: "alice", Relay: base, RoomID: "r1", RoomName: "proj", ParticipantID: "p1", Name: "alice",
 		Token: "token", RoomKey: e2ee.NewKey().String()}
-	if err := client.Save(id, false); err != nil {
+	if err := client.Save(id); err != nil {
 		t.Fatal(err)
 	}
 }

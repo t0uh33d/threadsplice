@@ -1,0 +1,118 @@
+{{define "main"}}
+{{with .Room}}
+<section class="card room-head">
+  <div class="title"><h1>{{.Room}}</h1>{{if .Owner}}<span class="badge owner">owner</span>{{end}}</div>
+  <p class="sub">Relay <code>{{.Relay}}</code> · you are <strong>{{.Name}}</strong>{{if ne .Alias .Name}} <span class="muted">(identity <code>{{.Alias}}</code>)</span>{{end}}</p>
+  <p class="e2ee">{{template "lock"}}<span>Messages are decrypted on this machine; the relay sees only ciphertext.
+  {{if .Owner}}You see every message in this room, including direct messages between participants.{{else}}You see messages to you, to the room, and your own.{{end}}</span></p>
+</section>
+{{end}}
+<div class="room-grid">
+  <div class="conv">
+    <section class="card">
+      <h2>Conversation</h2>
+      <ol id="feed" class="feed" role="log" aria-label="Conversation">
+        {{- if .Feed.Skipped}}<li class="note">{{.Feed.Skipped}} earlier messages not shown.</li>{{end -}}
+        {{- range .Feed.Rows}}{{template "row" .}}{{end -}}
+        <li class="empty">No messages yet. They appear here as the room talks.</li>
+      </ol>
+      <p id="feed-status" class="status error" role="status">{{.Feed.Err}}</p>
+      {{template "poller" .Feed}}
+    </section>
+    {{template "compose" .Compose}}
+  </div>
+  <aside class="panels">
+    {{template "participants" .Peers}}
+    {{if .Room.Owner}}
+    <section class="card">
+      <h2>Invite someone</h2>
+      <p class="muted small">For an agent or person on another machine.</p>
+      <form class="inline" hx-post="/r/{{.Room.Alias}}/invite" hx-target="#invite-result" hx-disabled-elt="find button">
+        <label for="i-ttl" class="sr">Invite lifetime</label>
+        <select id="i-ttl" name="ttl">{{range .TTLs}}{{if .Dur}}<option value="{{.Value}}"{{if eq .Value "24h"}} selected{{end}}>{{.Label}}</option>{{end}}{{end}}</select>
+        <button type="submit">Create invite</button>
+      </form>
+      <div id="invite-result">{{with .Flash}}{{template "invite" .}}{{end}}</div>
+    </section>
+    <section class="card">
+      <h2>Add an agent on this machine</h2>
+      <p class="muted small">Joins the room as a new identity here, ready for <code>threadsplice setup</code>.</p>
+      <form class="inline" hx-post="/r/{{.Room.Alias}}/agents" hx-target="#agent-result" hx-disabled-elt="find button" data-reset>
+        <label for="a-name" class="sr">Agent name</label>
+        <input id="a-name" name="name" required maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,31}" placeholder="claude-mac" spellcheck="false" autocomplete="off">
+        <button type="submit">Add agent</button>
+      </form>
+      <div id="agent-result"></div>
+    </section>
+    {{end}}
+    <section class="card">
+      <h2>Use this identity in an agent</h2>
+      <p class="links">{{range .Targets}}<a href="/setup/{{.}}?as={{$.Room.Alias}}">{{.}}</a>{{end}}</p>
+    </section>
+  </aside>
+</div>
+{{end}}
+
+{{define "row"}}<li{{with .ID}} id="m-{{.}}"{{end}} class="msg k-{{kind .Kind}}{{if .Mine}} mine{{end}}{{if .Err}} bad{{end}}">
+<div class="meta"><time datetime="{{.At.UTC.Format "2006-01-02T15:04:05Z"}}" title="{{.At.Local.Format "Mon Jan 2 2006 15:04:05"}}">{{clock .At}}</time>
+<span class="who">{{.From}}{{if .Mine}} <span class="muted">(you)</span>{{end}} <span aria-hidden="true">→</span><span class="sr">to</span> {{if .To}}{{.To}}{{if .ToMe}} <span class="muted">(you)</span>{{end}}{{else}}room{{end}}</span>
+{{if not .Err}}<span class="badge kind">{{.Kind}}</span>{{end}}
+{{with .ID}}<code class="mid" title="{{.}}">{{short .}}</code>{{end}}
+{{if .ReplyTo}}<a class="re" href="#m-{{.ReplyTo}}">↩ reply to <code>{{short .ReplyTo}}</code></a>{{end}}
+{{if gt .Depth 0}}<span class="depth">depth {{.Depth}}</span>{{end}}</div>
+{{if .Err}}<p class="err">Couldn't decrypt this message: {{.Err}}</p>{{else}}{{range blocks .Text}}{{if .Code}}<pre class="code">{{.Text}}</pre>{{else}}<div class="text">{{.Text}}</div>{{end}}{{end}}{{end}}
+</li>{{end}}
+
+{{define "poller"}}<div id="poller" hx-get="/r/{{.Room.Alias}}/feed?after={{.Last}}" hx-trigger="every 2s, ts-sent from:body" hx-swap="outerHTML"></div>{{end}}
+
+{{define "feed"}}
+{{- if or .Rows .Skipped}}<ol hx-swap-oob="beforeend:#feed">{{if .Skipped}}<li class="note">{{.Skipped}} messages skipped to catch up.</li>{{end}}{{range .Rows}}{{template "row" .}}{{end}}</ol>{{end}}
+<p id="feed-status" class="status error" role="status" hx-swap-oob="true">{{.Err}}</p>
+{{template "poller" .}}
+{{- end}}
+
+{{define "participants"}}<section id="participants" class="card" hx-get="/r/{{.Room.Alias}}/participants" hx-trigger="every 5s" hx-swap="outerHTML">
+<h2>Participants</h2>
+{{if .Err}}<p class="error" role="alert">{{.Err}}</p>{{end}}
+<ul class="peers">
+{{- range .Peers}}
+<li class="peer{{if .Revoked}} revoked{{end}}"{{if not (or .You .Revoked)}} data-to="{{.ID}}" data-name="{{.Name}}"{{end}}>
+<span class="dot{{if .Online}} on{{end}}" title="{{if .Revoked}}revoked{{else if .Online}}online{{else}}offline{{end}}"></span>
+<span class="pname">{{.Name}}{{if .You}} <span class="muted">(you)</span>{{end}}{{if .Owner}} <span class="badge owner">owner</span>{{end}}</span>
+{{- if and $.Room.Owner (not .You) (not .Revoked)}}
+<form hx-post="/r/{{$.Room.Alias}}/revoke" hx-target="#participants" hx-swap="outerHTML" hx-confirm="Revoke {{.Name}}? Their access ends now; what they already received stays readable to them.">
+<input type="hidden" name="pid" value="{{.ID}}"><button type="submit" id="revoke-{{.ID}}" class="danger small">Revoke</button></form>
+{{- end}}
+<span class="pmeta">{{if .Revoked}}revoked{{else}}<span class="sr">{{if .Online}}online,{{else}}offline,{{end}} </span>{{with .State}}<span class="state s-{{state .}}">{{.}}</span> · {{end}}seen {{ago .Seen}}{{end}}</span>
+</li>
+{{- end}}
+</ul>
+</section>{{end}}
+
+{{define "compose"}}<form id="compose" class="card compose" hx-post="/r/{{.Room.Alias}}/send" hx-swap="outerHTML" hx-disabled-elt="find button">
+<h2>Send as {{.Room.Name}}</h2>
+<p class="muted small">Encrypted here, then relayed as <strong>{{.Room.Name}}</strong>. Agents get it as a message from a peer in the room, not from their own user.</p>
+<div class="fields">
+<label>To <select name="to"><option value="">room (everyone)</option>{{range .Peers}}<option value="{{.ID}}"{{if eq .ID $.To}} selected{{end}}>{{.Name}}</option>{{end}}</select></label>
+<label>Kind <select name="kind"><option value="message">message</option><option value="ask"{{if eq .Kind "ask"}} selected{{end}}>ask (expects a reply)</option></select></label>
+</div>
+<label for="compose-text" class="sr">Message</label>
+<textarea id="compose-text" name="text" rows="3" required maxlength="98304" placeholder="Write a message (Ctrl+Enter sends)"{{if or .Sent .Err}} autofocus{{end}}>{{.Text}}</textarea>
+{{if .Err}}<p class="error" role="alert">{{.Err}}</p>{{end}}
+<div class="actions"><button type="submit">Send as {{.Room.Name}}</button>{{if .Sent}}<span class="ok" role="status">Sent.</span>{{end}}</div>
+</form>{{end}}
+
+{{define "invite"}}{{if .Err}}<p class="error" role="alert">{{.Err}}</p>{{else}}<div class="invite">
+<p class="warn"><strong>Share this privately.</strong> It contains the room key: whoever holds it can join once and read the room. Single use; expires {{.Expires}}.</p>
+<label for="invite-value">Invite</label>
+<div class="copyrow"><input id="invite-value" class="mono" readonly value="{{.Invite}}"><button type="button" class="ghost small" data-copy="invite-value">Copy</button></div>
+<p class="label">On the other machine</p>
+<div class="copyrow"><pre id="invite-cmd" class="mono">{{.Command}}</pre><button type="button" class="ghost small" data-copy="invite-cmd">Copy</button></div>
+</div>{{end}}{{end}}
+
+{{define "agent"}}<div class="added">
+<p class="ok"><strong>{{.Name}}</strong> joined the room as a new identity on this machine{{if ne .Alias .Name}} (identity <code>{{.Alias}}</code>){{end}}.</p>
+<p class="small">Next, connect the agent: run its setup command here and add the configuration it prints.</p>
+<ul class="cmds">{{range .Targets}}<li><code>threadsplice setup {{.}} -as {{$.Alias}}</code> <a href="/setup/{{.}}?as={{$.Alias}}">view</a></li>{{end}}</ul>
+</div>
+<div hx-swap-oob="innerHTML:#nav">{{template "nav" .Frame}}</div>{{end}}

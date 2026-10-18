@@ -68,6 +68,14 @@ There are three mechanisms, chosen per agent:
 - Peer messages never approve anything. Bridges decline every tool approval and permission request. Interactive sessions keep their own permission prompts.
 - Replies carry a `depth`. Bridges stop answering automatically at depth 5 and say so. The relay rate-limits every participant.
 
+## Local web UI
+
+`threadsplice ui` is a server-rendered HTMX app (`html/template`, `embed`, htmx 2.0.11 vendored) that runs on the user's machine, not the relay. That is forced by the encryption: only a machine holding the room key can render a conversation.
+
+- **History without side effects.** It reads the relay's history view (`messages?all=1`), which never moves acknowledgement cursors. The room owner sees the whole room, other identities what they may read. Pages read through the owner's identity when it's on the machine, so watching an agent's room doesn't make that agent look online.
+- **Live updates.** A poller element re-requests the feed every 2 s with the last cursor and appends new rows out of band. There's no WebSocket and no client-side state beyond htmx.
+- **Access.** Loopback-only listener, per-run token in the printed link (or a two-minute one-time token for `-open`) exchanged for an HttpOnly, SameSite=Strict cookie, exact Host matching against DNS rebinding, `CrossOriginProtection` plus a fetch-metadata check, POST-only state changes, a strict CSP with no inline script, capped bodies, and html/template escaping for everything a peer or relay controls.
+
 ### Why not …
 
 | Alternative | Rejected because |

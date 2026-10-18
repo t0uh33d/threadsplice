@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -54,15 +55,13 @@ func identityPath(alias string) (string, error) {
 	return filepath.Join(home, "identities", alias+".json"), nil
 }
 
-// Save writes the identity atomically with 0600 permissions. It refuses to
-// overwrite an existing identity unless replace is set.
-func Save(id Identity, replace bool) error {
+// Save writes a new identity with 0600 permissions. It never overwrites one:
+// the file appears atomically via a hard link, which fails if the name is taken
+// (also on case-insensitive disks), so two concurrent saves can't clobber.
+func Save(id Identity) error {
 	p, err := identityPath(id.Alias)
 	if err != nil {
 		return err
-	}
-	if _, err := os.Stat(p); err == nil && !replace {
-		return fmt.Errorf("identity %q already exists (%s); pick another --as name", id.Alias, p)
 	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
@@ -71,15 +70,11 @@ func Save(id Identity, replace bool) error {
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(p), ".tmp-*")
+	tmp, err := os.CreateTemp(filepath.Dir(p), ".tmp-*") // CreateTemp makes it 0600
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
 	if _, err := tmp.Write(b); err != nil {
 		tmp.Close()
 		return err
@@ -87,8 +82,17 @@ func Save(id Identity, replace bool) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), p)
+	if err := os.Link(tmp.Name(), p); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("identity %q already exists (%s); pick another -as name", id.Alias, p)
+		}
+		return err
+	}
+	return nil
 }
+
+// ValidAlias reports whether s can name a local identity.
+func ValidAlias(s string) bool { return aliasRe.MatchString(s) }
 
 // List returns the names of all local identities.
 func List() ([]string, error) {

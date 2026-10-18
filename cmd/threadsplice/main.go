@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"regexp"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -35,6 +36,9 @@ Rooms and identities:
   threadsplice join -as NAME INVITE                          join a room from another machine
   threadsplice revoke [-as NAME] PARTICIPANT                 remove a participant (owner)
   threadsplice identities                                    list identities on this machine
+
+Web UI (local, loopback only):
+  threadsplice ui [-addr 127.0.0.1:4848] [-open]             rooms, invites and the live conversation
 
 Messaging:
   threadsplice peers [-as NAME] [-json]                      who is in the room, online, busy
@@ -189,7 +193,7 @@ func cmdRoomCreate(ctx context.Context, args []string) error {
 	key := e2ee.NewKey() // generated here; the relay never sees it
 	id := client.Identity{Alias: *as, Relay: strings.TrimRight(*relayURL, "/"), RoomID: m.RoomID, RoomName: m.RoomName,
 		ParticipantID: m.ParticipantID, Name: *as, Owner: true, Token: m.Token, RoomKey: key.String()}
-	if err := client.Save(id, false); err != nil {
+	if err := client.Save(id); err != nil {
 		return err
 	}
 	fmt.Printf("Created room %q; you are %q.\n", m.RoomName, *as)
@@ -219,6 +223,11 @@ func printInvite(ctx context.Context, id client.Identity, ttl time.Duration) err
 	if err != nil {
 		return err
 	}
+	// The token goes into a shell command the user pastes elsewhere: a relay
+	// must not be able to slip shell syntax into it.
+	if !inviteToken.MatchString(inv.Token) {
+		return fmt.Errorf("the relay returned a malformed invite token")
+	}
 	fmt.Printf(`
 Invite (single use, expires %s). It contains the room key: share it privately.
 
@@ -227,6 +236,9 @@ Invite (single use, expires %s). It contains the room key: share it privately.
 `, inv.ExpiresAt.Local().Format(time.RFC1123), client.FormatInvite(id.Relay, inv.Token, key))
 	return nil
 }
+
+// inviteToken is the shape of the invite tokens the relay mints (base64url).
+var inviteToken = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
 
 func cmdJoin(ctx context.Context, args []string) error {
 	fs := flags("join")
@@ -256,7 +268,7 @@ func cmdJoin(ctx context.Context, args []string) error {
 	}
 	id := client.Identity{Alias: *as, Relay: relayURL, RoomID: m.RoomID, RoomName: m.RoomName,
 		ParticipantID: m.ParticipantID, Name: *as, Token: m.Token, RoomKey: key.String()}
-	if err := client.Save(id, false); err != nil {
+	if err := client.Save(id); err != nil {
 		return err
 	}
 	fmt.Printf("Joined room %q as %q.\n", m.RoomName, *as)

@@ -1,0 +1,78 @@
+{{define "layout" -}}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="htmx-config" content='{"selfRequestsOnly":true,"allowScriptTags":false,"allowEval":false,"includeIndicatorStyles":false,"historyCacheSize":0,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"[45]..","swap":true,"error":true}]}'>
+<title>{{.Title}} · thread splice</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/htmx-2.0.11.min.js" defer></script>
+<script src="/static/ui.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="/">{{template "mark"}}<span>thread splice</span></a>
+  <span class="ver" title="threadsplice version">{{.Version}}</span>
+</header>
+<p id="offline" class="offline" role="alert" hidden>Lost contact with <code>threadsplice ui</code>. Is it still running?</p>
+<p id="expired" class="offline" role="alert" hidden>This tab's link is from an earlier run of <code>threadsplice ui</code>. Open the link it printed this time; this page then picks up where it left off.</p>
+<p id="notice" class="notice" role="alert"></p>
+<div class="shell">
+  <nav id="nav" class="side" aria-label="Rooms on this machine">{{template "nav" .}}</nav>
+  <main>{{template "main" .}}</main>
+</div>
+</body>
+</html>
+{{- end}}
+
+{{define "nav"}}
+<div class="nav-actions"><a class="btn small" href="/#create">New room</a><a class="btn small ghost" href="/#join">Join room</a></div>
+{{range .Nav}}
+<section class="nav-room">
+  <h2>{{.Name}}<span>{{.Relay}}</span></h2>
+  <ul>
+  {{- range .Members}}
+    <li>{{if .Broken}}<span class="muted">{{.Alias}} (unreadable)</span>{{else}}<a href="/r/{{.Alias}}" title="identity {{.Alias}}"{{if eq .Alias $.Current}} aria-current="page"{{end}}>{{.Name}}{{if .Owner}} <span class="badge owner">owner</span>{{end}}</a>{{end}}</li>
+  {{- end}}
+  </ul>
+</section>
+{{else}}
+<p class="muted small">No rooms on this machine yet.</p>
+{{end}}
+{{end}}
+
+{{define "error"}}<p class="error" role="alert">{{.}}</p>{{end}}
+
+{{define "notice"}}<p id="notice" class="notice" role="alert" hx-swap-oob="true">{{.}}</p>{{end}}
+
+{{define "lock"}}<svg class="lock" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M8 1a3.5 3.5 0 0 0-3.5 3.5V6H4a1.5 1.5 0 0 0-1.5 1.5v6A1.5 1.5 0 0 0 4 15h8a1.5 1.5 0 0 0 1.5-1.5v-6A1.5 1.5 0 0 0 12 6h-.5V4.5A3.5 3.5 0 0 0 8 1Zm2 5H6V4.5a2 2 0 1 1 4 0V6Z"/></svg>{{end}}
+
+{{define "mark"}}<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="28" height="28" aria-hidden="true">
+<defs>
+<linearGradient id="ts-bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1B2140"/><stop offset="1" stop-color="#0B0E1C"/></linearGradient>
+<linearGradient id="ts-amber" gradientUnits="userSpaceOnUse" x1="64" y1="390" x2="346" y2="112"><stop offset="0" stop-color="#FFC56E"/><stop offset="1" stop-color="#FF6A4D"/></linearGradient>
+<linearGradient id="ts-cyan" gradientUnits="userSpaceOnUse" x1="166" y1="112" x2="448" y2="390"><stop offset="0" stop-color="#5CF2DA"/><stop offset="1" stop-color="#3A8DFF"/></linearGradient>
+<mask id="ts-under" maskUnits="userSpaceOnUse" x="0" y="0" width="512" height="512"><rect width="512" height="512" fill="#fff"/><path d="M226 296 L286 356" stroke="#000" stroke-width="68"/></mask>
+</defs>
+<rect width="512" height="512" rx="112" fill="url(#ts-bg)"/>
+<g fill="none" stroke-width="46">
+<path d="M64 390 C146 390 216 366 256 326 C296 286 346 275 346 219 C346 155 306 112 256 112" stroke="url(#ts-amber)" mask="url(#ts-under)"/>
+<path d="M256 112 C206 112 166 155 166 219 C166 275 216 286 256 326 C296 366 366 390 448 390" stroke="url(#ts-cyan)"/>
+</g>
+<circle cx="64" cy="390" r="23" fill="#FFC56E"/>
+<circle cx="448" cy="390" r="23" fill="#3A8DFF"/>
+</svg>{{end}}
+
+{{define "unauthorized" -}}
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Open the link · thread splice</title></head>
+<body>
+<h1>thread splice</h1>
+<p>This page needs its access link. Open the URL printed by <code>threadsplice ui</code> in this browser.</p>
+<p>Each run prints a new link; links from earlier runs stop working.</p>
+</body>
+</html>
+{{- end}}

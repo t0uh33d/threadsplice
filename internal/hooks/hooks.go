@@ -38,7 +38,6 @@ type input struct {
 	Event          string `json:"hook_event_name"`
 	SessionID      string `json:"session_id"` // for Codex, the thread id
 	CopilotSession string `json:"sessionId"`
-	Cwd            string `json:"cwd"`
 	AgentID        string `json:"agent_id"` // set on any event a subagent fires (Codex: UserPromptSubmit too)
 	CopilotAgent   string `json:"agentId"`
 	StopHookActive bool   `json:"stop_hook_active"` // this stop follows a block already
@@ -150,13 +149,9 @@ func handle(ctx context.Context, a *client.Agent, agent, ev string, p input) (*o
 	// you already left, so it doesn't count.
 	reregister := ev == "UserPromptSubmit" && agent == "codex" && !strings.HasPrefix(p.Prompt, client.EnvelopePrefix)
 	if (ev == "SessionStart" || reregister) && !sub && sid != "" {
-		s := client.SessionInfo{Agent: agent, SessionID: sid, Cwd: p.Cwd}
-		if s.Cwd == "" {
-			s.Cwd, _ = os.Getwd()
-		}
+		s := client.SessionInfo{Agent: agent, SessionID: sid}
 		if agent == "claude" {
 			s.Socket = os.Getenv("CLAUDE_CODE_MESSAGING_SOCKET")
-			s.PID, _ = strconv.Atoi(os.Getenv("CLAUDE_PID"))
 		}
 		if err := client.SaveSession(a.ID.Alias, s); err != nil {
 			return nil, err

@@ -15,8 +15,6 @@ type SessionInfo struct {
 	Agent     string    `json:"agent"`            // "claude", "codex" or "copilot"
 	SessionID string    `json:"session_id"`       // agent session id (for Codex: the thread id)
 	Socket    string    `json:"socket,omitempty"` // Claude Code: CLAUDE_CODE_MESSAGING_SOCKET
-	Cwd       string    `json:"cwd,omitempty"`
-	PID       int       `json:"pid,omitempty"` // the agent process, when known
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
