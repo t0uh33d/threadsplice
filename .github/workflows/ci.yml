@@ -22,6 +22,34 @@ jobs:
       - run: go vet ./...
       - run: go test -race -count=1 ./...
       - run: go build -trimpath ./cmd/threadsplice
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: sh -n install.sh
+      - run: if command -v shellcheck >/dev/null; then shellcheck install.sh; else echo "no shellcheck on this runner"; fi
+      - name: Install from a local copy of a release
+        run: |
+          name=threadsplice_$(go env GOOS)_$(go env GOARCH)
+          rel=dist/download/v0.0.0-test
+          mkdir -p "$rel" "dist/$name"
+          CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o "dist/$name/threadsplice" ./cmd/threadsplice
+          cp LICENSE README.md "dist/$name/"
+          tar -czf "$rel/$name.tar.gz" -C "dist/$name" threadsplice LICENSE README.md
+          (cd "$rel" && shasum -a 256 "$name.tar.gz" > SHA256SUMS)
+          export THREADSPLICE_DOWNLOAD_BASE="file://$PWD/dist" THREADSPLICE_VERSION=v0.0.0-test THREADSPLICE_INSTALL_DIR="$RUNNER_TEMP/bin"
+          sh install.sh
+          "$RUNNER_TEMP/bin/threadsplice" version
+          printf x >> "$rel/$name.tar.gz"
+          if sh install.sh 2> "$RUNNER_TEMP/tampered.log"; then echo "install.sh accepted a tampered archive"; exit 1; fi
+          grep 'checksum mismatch' "$RUNNER_TEMP/tampered.log"
   vuln:
     runs-on: ubuntu-latest
     steps:
