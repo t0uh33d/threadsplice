@@ -18,7 +18,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -43,6 +42,7 @@ type input struct {
 	AgentID        string `json:"agent_id"` // set on any event a subagent fires (Codex: UserPromptSubmit too)
 	CopilotAgent   string `json:"agentId"`
 	StopHookActive bool   `json:"stop_hook_active"` // this stop follows a block already
+	Prompt         string `json:"prompt"`           // UserPromptSubmit
 }
 
 // output is a hook response; its shape depends on the agent (see withContext, block).
@@ -144,9 +144,12 @@ func handle(ctx context.Context, a *client.Agent, agent, ev string, p input) (*o
 		style = "vscode"
 	}
 	var peers []api.Participant
-	// Codex also re-registers on every prompt: its MCP servers can restart
-	// mid-session, and the deliverer ignores records older than itself.
-	if (ev == "SessionStart" || (ev == "UserPromptSubmit" && agent == "codex")) && !sub && sid != "" {
+	// Codex also re-registers on every prompt you type: its MCP servers can
+	// restart mid-session, and the deliverer ignores records older than itself.
+	// A queued peer message is not you typing, and may be landing in a thread
+	// you already left, so it doesn't count.
+	reregister := ev == "UserPromptSubmit" && agent == "codex" && !strings.HasPrefix(p.Prompt, client.EnvelopePrefix)
+	if (ev == "SessionStart" || reregister) && !sub && sid != "" {
 		s := client.SessionInfo{Agent: agent, SessionID: sid, Cwd: p.Cwd}
 		if s.Cwd == "" {
 			s.Cwd, _ = os.Getwd()
@@ -256,12 +259,10 @@ func welcome(id client.Identity, ps []api.Participant, unread int) string {
 	return b.String()
 }
 
-var nameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
-
 // safeName masks a name that breaks the relay's naming rule. Names come from
 // the relay, which isn't trusted with anything that reaches the model.
 func safeName(s string) string {
-	if nameRe.MatchString(s) {
+	if api.ValidName(s) {
 		return s
 	}
 	return "?"
@@ -413,7 +414,7 @@ const codexSetup = `Codex CLI (paths are under $CODEX_HOME, ~/.codex by default)
     command = "threadsplice"
     args = ["mcp", "-as", "NAME"]
     # Codex hands MCP servers only a few environment variables; pass these through.
-    env_vars = ["THREADSPLICE_HOME", "THREADSPLICE_AS", "CODEX_HOME"]
+    env_vars = ["THREADSPLICE_HOME", "THREADSPLICE_AS", "CODEX_HOME", "XDG_CONFIG_HOME", "THREADSPLICE_BRIDGE"]
     # Optional: let Codex use these tools without asking each time (sending included).
     # default_tools_approval_mode = "approve"
 
@@ -434,8 +435,9 @@ const codexSetupEnd = `
 
 Headless alternative, for a Codex that answers asks on its own: keep a bridge running that hands
 each message to its own Codex thread (as tool output, below user authority) and sends the answer
-back. The bridge turns hooks and MCP servers off for its Codex, so this setup can stay. Give the
-bridge its own identity (join the room again under another name) and run it with that name:
+back. The bridge runs its Codex under its own CODEX_HOME holding just a link to your login, so
+none of your MCP servers, plugins or hooks load there and this setup can stay. Give the bridge its
+own identity (join the room again under another name) and run it with that name:
 
     threadsplice bridge codex -as <bridge identity>
 `

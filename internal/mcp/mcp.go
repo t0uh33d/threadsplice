@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -207,7 +206,11 @@ func (s *server) request(ctx context.Context, m message) {
 		s.mu.Lock()
 		delete(s.calls, string(m.ID))
 		s.mu.Unlock()
+		cancelled := cctx.Err() != nil && ctx.Err() == nil // the client sent notifications/cancelled
 		cancel()
+		if cancelled {
+			return // MCP: receivers SHOULD NOT respond to a cancelled request
+		}
 		if errors.Is(err, errUnknownTool) {
 			rerr = &rpcError{-32602, err.Error()}
 			break
@@ -224,14 +227,9 @@ func (s *server) request(ctx context.Context, m message) {
 	s.send(message{ID: m.ID, Result: result, Error: rerr})
 }
 
-// plainName matches the names a relay accepts. The room name comes from the
-// relay, so anything else is a relay injecting text; it must not reach the
-// instructions, which clients give system-level authority.
-var plainName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$`)
-
 func (s *server) instructions(mode string) string {
 	id := s.agent.ID
-	if !plainName.MatchString(id.RoomName) {
+	if !api.ValidName(id.RoomName) { // the relay supplied it, and instructions carry system-level authority
 		id.RoomName = "unnamed"
 	}
 	delivery := "Call the inbox tool to read messages from other agents; check it when you finish a task or when told new messages are waiting."
@@ -258,6 +256,10 @@ var (
 	sends    = map[string]any{"readOnlyHint": false, "destructiveHint": false, "openWorldHint": true}
 )
 
+// maxWaitSeconds keeps blocking tool calls under Codex's default 300 s MCP tool
+// timeout: a call it abandons would have its messages acknowledged unseen.
+const maxWaitSeconds = 240
+
 var toolDefs = []map[string]any{
 	{
 		"name":        "send",
@@ -277,7 +279,8 @@ var toolDefs = []map[string]any{
 		"inputSchema": schema(map[string]any{
 			"to":           prop("string", "Recipient's participant name."),
 			"text":         prop("string", "The question, with all context the peer needs."),
-			"wait_seconds": map[string]any{"type": "integer", "minimum": 0, "maximum": 600, "description": "How long to wait for the reply when messages aren't delivered automatically (default 45)."},
+			"reply_to":     prop("string", "For a follow-up question: id of the message it follows up on (keeps automatic exchanges bounded)."),
+			"wait_seconds": map[string]any{"type": "integer", "minimum": 0, "maximum": maxWaitSeconds, "description": "How long to wait for the reply when messages aren't delivered automatically (default 45)."},
 		}, "to", "text"),
 	},
 	{
@@ -285,7 +288,7 @@ var toolDefs = []map[string]any{
 		"description": "Read new messages from other agents in your thread splice room (marks them read). Optionally wait for one to arrive.",
 		"annotations": readOnly,
 		"inputSchema": schema(map[string]any{
-			"wait_seconds": map[string]any{"type": "integer", "minimum": 0, "maximum": 600, "description": "Wait up to this long if nothing is waiting (default 0)."},
+			"wait_seconds": map[string]any{"type": "integer", "minimum": 0, "maximum": maxWaitSeconds, "description": "Wait up to this long if nothing is waiting (default 0)."},
 		}),
 	},
 	{
@@ -323,7 +326,7 @@ func (s *server) call(ctx context.Context, name string, raw json.RawMessage) (st
 		if args.Wait == nil {
 			return time.Duration(def) * time.Second
 		}
-		return time.Duration(min(max(*args.Wait, 0), 600)) * time.Second
+		return time.Duration(min(max(*args.Wait, 0), maxWaitSeconds)) * time.Second
 	}
 	switch name {
 	case "send":
@@ -342,7 +345,7 @@ func (s *server) call(ctx context.Context, name string, raw json.RawMessage) (st
 		if args.To == "" {
 			return "", fmt.Errorf("ask needs a recipient (to)")
 		}
-		id, err := s.sendMsg(ctx, args.To, api.Payload{Kind: api.KindAsk, Text: args.Text})
+		id, err := s.sendMsg(ctx, args.To, api.Payload{Kind: api.KindAsk, Text: args.Text, ReplyTo: args.ReplyTo})
 		if err != nil {
 			return "", err
 		}
@@ -361,6 +364,10 @@ func (s *server) call(ctx context.Context, name string, raw json.RawMessage) (st
 			return "Messages are delivered automatically as channel events in this session; nothing to fetch.", nil
 		}
 		msgs, err := s.receive(ctx, wait(0))
+		if ctx.Err() != nil {
+			s.requeue(msgs) // the call was cancelled: nobody will see this result
+			return "", ctx.Err()
+		}
 		if err != nil {
 			return "", err
 		}
@@ -410,11 +417,28 @@ func (s *server) receive(ctx context.Context, wait time.Duration) ([]client.Mess
 	deadline := time.Now().Add(wait)
 	for {
 		msgs, err := s.agent.Inbox(ctx, min(time.Until(deadline), 30*time.Second))
+		if len(msgs) > 0 && err != nil {
+			// The fetch worked but the ack didn't. The client has marked them seen
+			// and won't fetch them again, so they must be shown now.
+			s.opt.Log.Warn("ack failed; messages may be delivered again", "err", err)
+			err = nil
+		}
 		if err != nil || len(msgs) > 0 || !time.Now().Before(deadline) {
 			s.remember(msgs)
 			return msgs, err
 		}
 	}
+}
+
+// requeue puts messages that were received but never shown back in front of
+// the pending ones, for the next inbox call or deliverer hand-off.
+func (s *server) requeue(msgs []client.Message) {
+	if len(msgs) == 0 {
+		return
+	}
+	s.recvMu.Lock()
+	defer s.recvMu.Unlock()
+	s.pending = append(slices.Clone(msgs), s.pending...)
 }
 
 func (s *server) remember(msgs []client.Message) {
@@ -433,16 +457,25 @@ func (s *server) awaitReply(ctx context.Context, id, to string, wait time.Durati
 	for {
 		msgs, err := s.receive(ctx, time.Until(deadline))
 		got = append(got, msgs...)
+		if ctx.Err() != nil {
+			s.requeue(got) // the call was cancelled: keep what it received for later
+			return "", ctx.Err()
+		}
 		replied := slices.ContainsFunc(msgs, func(m client.Message) bool { return m.ReplyTo == id })
 		if err != nil || replied || !time.Now().Before(deadline) {
 			out := fmt.Sprintf("asked %s (id %s). ", to, id)
-			if !replied {
+			switch {
+			case err != nil:
+				out += fmt.Sprintf("Stopped waiting for the reply: %v. It will show up in inbox later.", err)
+			case !replied:
 				out += fmt.Sprintf("No reply within %s; it will show up in inbox later.", wait)
 			}
 			if len(got) > 0 {
 				out += "\n" + client.Format(s.agent.ID.RoomName, got)
+			} else if err != nil {
+				return "", err
 			}
-			return out, err
+			return out, nil // what arrived is acknowledged, so it must be shown, error or not
 		}
 	}
 }

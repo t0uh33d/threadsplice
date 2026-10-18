@@ -146,6 +146,9 @@ func cmdRelay(ctx context.Context, args []string) error {
 	if err := parse(fs, args); err != nil {
 		return err
 	}
+	if *retention < time.Hour {
+		return usageError("relay: -retention must be at least 1h")
+	}
 	return relay.Run(ctx, *addr, relay.Config{
 		DBPath:     *db,
 		AdminToken: os.Getenv("THREADSPLICE_ADMIN_TOKEN"),
@@ -179,6 +182,9 @@ func cmdRoomCreate(ctx context.Context, args []string) error {
 	m, err := client.New(*relayURL, *adminToken).CreateRoom(ctx, *name, *as)
 	if err != nil {
 		return err
+	}
+	if !api.ValidName(m.RoomName) { // it reaches models later; the relay must not slip text in
+		return fmt.Errorf("the relay returned an invalid room name")
 	}
 	key := e2ee.NewKey() // generated here; the relay never sees it
 	id := client.Identity{Alias: *as, Relay: strings.TrimRight(*relayURL, "/"), RoomID: m.RoomID, RoomName: m.RoomName,
@@ -244,6 +250,9 @@ func cmdJoin(ctx context.Context, args []string) error {
 	m, err := client.New(relayURL, "").Join(ctx, token, *as) // the key stays local
 	if err != nil {
 		return err
+	}
+	if !api.ValidName(m.RoomName) { // it reaches models later; the relay must not slip text in
+		return fmt.Errorf("the relay returned an invalid room name")
 	}
 	id := client.Identity{Alias: *as, Relay: relayURL, RoomID: m.RoomID, RoomName: m.RoomName,
 		ParticipantID: m.ParticipantID, Name: *as, Token: m.Token, RoomKey: key.String()}

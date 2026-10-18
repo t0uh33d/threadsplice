@@ -35,7 +35,7 @@ func TestMain(m *testing.M) {
 // fakeCodex speaks just enough app-server to start a thread, then exits with
 // status 3 on the first turn/start, like a crash mid-turn.
 func fakeCodex() int {
-	if a := strings.Join(os.Args[1:], " "); a != "-c features.hooks=false -c mcp_servers={} app-server --listen stdio://" || os.Getenv("THREADSPLICE_BRIDGE") != "1" {
+	if a := strings.Join(os.Args[1:], " "); a != "-c features.hooks=false app-server --listen stdio://" || os.Getenv("THREADSPLICE_BRIDGE") != "1" || os.Getenv("CODEX_HOME") != os.Getenv("THREADSPLICE_FAKE_CODEX_HOME") {
 		fmt.Fprintln(os.Stderr, "fake codex: unexpected arguments:", a)
 		return 2
 	}
@@ -398,9 +398,12 @@ func TestProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("THREADSPLICE_FAKE_CODEX", "1")
+	home := t.TempDir()
+	t.Setenv("THREADSPLICE_FAKE_CODEX_HOME", home) // the fake checks it got exactly this CODEX_HOME
+	t.Setenv("CODEX_HOME", "/somewhere/else")      // ...overriding the user's
 	ctx := context.Background()
 
-	s, err := Start(ctx, Options{Bin: bin, Cwd: t.TempDir()})
+	s, err := Start(ctx, Options{Bin: bin, Cwd: t.TempDir(), Home: home})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +424,7 @@ func TestProcess(t *testing.T) {
 	}
 
 	// Close ends a healthy app-server by closing its stdin.
-	s2, err := Start(ctx, Options{Bin: bin})
+	s2, err := Start(ctx, Options{Bin: bin, Home: home})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -437,7 +440,7 @@ func TestProcess(t *testing.T) {
 
 	// A relative -codex path means relative to us, not to the thread's directory.
 	t.Chdir(filepath.Dir(bin))
-	s3, err := Start(ctx, Options{Bin: "." + string(filepath.Separator) + filepath.Base(bin), Cwd: t.TempDir()})
+	s3, err := Start(ctx, Options{Bin: "." + string(filepath.Separator) + filepath.Base(bin), Cwd: t.TempDir(), Home: home})
 	if err != nil {
 		t.Fatalf("Start with a relative binary path: %v", err)
 	}

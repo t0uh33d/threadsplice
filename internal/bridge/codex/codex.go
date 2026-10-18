@@ -44,6 +44,7 @@ type Options struct {
 	ThreadID    string        // resume this thread; empty starts a new one
 	TurnTimeout time.Duration // default DefaultTurnTimeout
 	Version     string        // reported to Codex as clientInfo.version
+	Home        string        // CODEX_HOME for the app-server; empty inherits ours
 	Log         *slog.Logger
 }
 
@@ -143,11 +144,16 @@ func Start(ctx context.Context, opt Options) (*Session, error) {
 			return nil, err
 		}
 	}
-	// Hooks and MCP servers from the user's ~/.codex config stay off in the
-	// bridge's thread: the user's own thread splice hooks would re-point their
-	// interactive identity at this thread, and peers must not drive their tools.
-	cmd := exec.Command(opt.Bin, "-c", "features.hooks=false", "-c", "mcp_servers={}", "app-server", "--listen", "stdio://")
+	// Peers must not drive the user's MCP servers or trigger their hooks (the
+	// user's own thread splice hooks would re-point their interactive identity
+	// at this thread). Config overrides can't empty Codex's merged mcp_servers
+	// table, so the CLI runs the bridge under its own CODEX_HOME (opt.Home);
+	// hooks are switched off here as well.
+	cmd := exec.Command(opt.Bin, "-c", "features.hooks=false", "app-server", "--listen", "stdio://")
 	cmd.Dir, cmd.Stderr, cmd.Env = opt.Cwd, os.Stderr, bridge.ChildEnv()
+	if opt.Home != "" {
+		cmd.Env = append(cmd.Env, "CODEX_HOME="+opt.Home) // the last duplicate wins
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err

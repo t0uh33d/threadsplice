@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/t0uh33d/threadsplice/internal/client"
@@ -138,11 +139,18 @@ func (s *server) claudeDeliverer() (*deliverer, error) {
 // hook recorded. Codex runs that hook at the session's first turn, after it
 // started this server, so an older record is an earlier session's: queuing
 // there would strand the message in a thread nobody is looking at.
+//
+// The server latches onto the first fresh thread it sees. Codex keeps a thread
+// you left (and its MCP servers) loaded for a while, so a server outliving its
+// session must not follow the record into the next session's thread: once the
+// record names another thread, this server holds and the newer one delivers.
 func (s *server) codexDeliverer() (*deliverer, error) {
 	bin, err := codexPath()
 	if err != nil {
 		return nil, err
 	}
+	var mu sync.Mutex
+	var latched string
 	return &deliverer{
 		name: "codex",
 		target: func() string {
@@ -150,7 +158,15 @@ func (s *server) codexDeliverer() (*deliverer, error) {
 			if !ok || si.Agent != "codex" || si.UpdatedAt.Before(s.startedAt.Add(-sessionSlack)) {
 				return ""
 			}
-			return si.SessionID // for Codex, the root thread id
+			mu.Lock()
+			defer mu.Unlock()
+			if latched == "" {
+				latched = si.SessionID // for Codex, the root thread id
+			}
+			if si.SessionID != latched {
+				return ""
+			}
+			return latched
 		},
 		push: func(ctx context.Context, thread, text string) error { return codexQueue(ctx, bin, thread, text) },
 	}, nil

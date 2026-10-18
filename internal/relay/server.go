@@ -203,8 +203,8 @@ func (s *Server) createRoom(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if !validName(req.Name) || !validName(req.Owner) {
-		httpError(w, http.StatusBadRequest, nameRule)
+	if !api.ValidName(req.Name) || !api.ValidName(req.Owner) {
+		httpError(w, http.StatusBadRequest, api.NameRule)
 		return
 	}
 	token := newToken()
@@ -222,8 +222,8 @@ func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if !validName(req.Name) {
-		httpError(w, http.StatusBadRequest, nameRule)
+	if !api.ValidName(req.Name) {
+		httpError(w, http.StatusBadRequest, api.NameRule)
 		return
 	}
 	token := newToken()
@@ -502,15 +502,11 @@ func hashToken(tok string) []byte {
 	return h[:]
 }
 
-const nameRule = "names must be 1-32 characters of [A-Za-z0-9._-], starting with a letter or digit"
-
 var (
-	nameRe  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$`)
 	idRe    = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 	stateRe = regexp.MustCompile(`^[a-z_]{1,16}$`)
 )
 
-func validName(s string) bool  { return nameRe.MatchString(s) }
 func validID(s string) bool    { return idRe.MatchString(s) }
 func validState(s string) bool { return stateRe.MatchString(s) }
 

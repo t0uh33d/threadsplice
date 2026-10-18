@@ -508,9 +508,9 @@ func TestSetup(t *testing.T) {
 			`"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "threadsplice hook codex -as alice", "timeout": 10}]}],`,
 			`"Stop": [{"hooks": [{"type": "command", "command": "threadsplice hook codex -as alice", "timeout": 10}]}],`,
 			"run /hooks to trust",
-			`env_vars = ["THREADSPLICE_HOME", "THREADSPLICE_AS", "CODEX_HOME"]`, // Codex filters MCP server env
+			`env_vars = ["THREADSPLICE_HOME", "THREADSPLICE_AS", "CODEX_HOME", "XDG_CONFIG_HOME", "THREADSPLICE_BRIDGE"]`, // Codex filters MCP server env
 			"threadsplice bridge codex -as <bridge identity>",
-			"bridge its own identity",
+			"own identity (join the room again under another name)",
 		},
 		"copilot": {
 			"~/.copilot/mcp-config.json",

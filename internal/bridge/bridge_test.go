@@ -53,7 +53,7 @@ func TestChildEnv(t *testing.T) {
 type bigSession struct{}
 
 func (bigSession) Turn(context.Context, string) (string, error) {
-	return strings.Repeat("é", maxAnswer), nil // multi-byte: truncation must keep valid UTF-8
+	return strings.Repeat("é<", maxPayload), nil // multi-byte and HTML-escaped: the fit must hold after escaping
 }
 
 func TestBridge(t *testing.T) {
@@ -136,7 +136,7 @@ func TestBridge(t *testing.T) {
 		}
 		for _, r := range msgs {
 			if r.ReplyTo == big {
-				if !strings.Contains(r.Text, "truncated") || !utf8.ValidString(r.Text) || len(r.Text) > maxAnswer+200 {
+				if !strings.Contains(r.Text, "truncated") || !utf8.ValidString(r.Text) || len(r.Text) > maxPayload {
 					t.Fatalf("oversized answer: len %d, truncated note %v, valid %v", len(r.Text), strings.Contains(r.Text, "truncated"), utf8.ValidString(r.Text))
 				}
 				return

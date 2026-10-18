@@ -6,8 +6,12 @@ package bridge
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"slices"
 	"strings"
@@ -26,10 +30,6 @@ type Session interface {
 
 // DefaultMaxDepth stops automatic ask/reply chains after five exchanges.
 const DefaultMaxDepth = client.MaxAutoDepth
-
-// maxAnswer keeps a reply under the relay's 128 KiB sealed-message limit after
-// JSON escaping and sealing overhead.
-const maxAnswer = 64 << 10
 
 // ChildEnv is the environment for an agent a bridge drives: ours, minus the
 // relay admin token, plus client.BridgeEnv so this binary's hooks and MCP
@@ -95,8 +95,7 @@ func handle(ctx context.Context, a *client.Agent, s Session, m client.Message, o
 	}
 	ask := m.Kind == api.KindAsk
 	reply := func(text string) error {
-		_, err := a.Send(ctx, m.From, api.Payload{Kind: api.KindReply, ReplyTo: m.ID, Text: text, Depth: m.Depth + 1})
-		return err
+		return sendReply(ctx, a, m.From, fit(api.Payload{Kind: api.KindReply, ReplyTo: m.ID, Text: text, Depth: m.Depth + 1}), opt.Log)
 	}
 	if ask && m.Depth+1 > opt.MaxDepth {
 		opt.Log.Warn("loop budget exhausted; not answering", "id", m.ID, "from", m.FromName, "depth", m.Depth)
@@ -121,10 +120,53 @@ func handle(ctx context.Context, a *client.Agent, s Session, m client.Message, o
 		answer = "[thread splice bridge] The agent could not complete this turn: " + reason
 	case strings.TrimSpace(answer) == "":
 		answer = "[thread splice bridge] The agent finished the turn without a text answer."
-	case len(answer) > maxAnswer:
-		answer = strings.ToValidUTF8(answer[:maxAnswer], "") + "\n[thread splice bridge] Answer truncated to fit the relay's message size limit."
 	}
 	return reply(answer)
+}
+
+// sendReply delivers a finished turn's answer, retrying under one message id
+// (the relay drops duplicates) until it lands or ctx ends: moving past an ask
+// whose answer was lost would throw the turn away.
+func sendReply(ctx context.Context, a *client.Agent, to string, p api.Payload, log *slog.Logger) error {
+	id := rand.Text()
+	for attempt := 1; ; attempt++ {
+		_, err := a.SendID(ctx, id, to, p)
+		var se *client.StatusError
+		switch {
+		case err == nil:
+			return nil
+		case ctx.Err() != nil:
+			return ctx.Err()
+		case errors.As(err, &se) && se.Code < 500 && se.Code != http.StatusTooManyRequests:
+			return err // the relay refused it (asker revoked, ...): retrying won't help
+		case attempt == 10:
+			return fmt.Errorf("reply not delivered after %d attempts: %w", attempt, err)
+		}
+		log.Warn("reply not delivered yet; retrying", "attempt", attempt, "err", err)
+		sleep(ctx, client.Backoff(attempt))
+	}
+}
+
+// maxPayload keeps a reply under the relay's 128 KiB sealed-message limit:
+// sealing adds 29 bytes, and some room is left to spare.
+const maxPayload = 120 << 10
+
+// fit truncates p.Text until the marshaled payload fits, measuring after JSON
+// escaping, which can make a character take up to six bytes.
+func fit(p api.Payload) api.Payload {
+	const note = "\n[thread splice bridge] Answer truncated to fit the relay's message size limit."
+	for {
+		b, _ := json.Marshal(p)
+		over := len(b) - maxPayload
+		if over <= 0 {
+			return p
+		}
+		keep := max(len(p.Text)-over-len(note), 0)
+		p.Text = strings.ToValidUTF8(p.Text[:keep], "") + note
+		if keep == 0 {
+			return p
+		}
+	}
 }
 
 func sleep(ctx context.Context, d time.Duration) {

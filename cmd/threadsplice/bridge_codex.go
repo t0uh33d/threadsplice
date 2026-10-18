@@ -30,12 +30,13 @@ func cmdBridgeCodex(ctx context.Context, args []string) error {
 	maxDepth := fs.Int("max-depth", bridge.DefaultMaxDepth, "stop answering automatic ask/reply chains at this depth")
 	turnTimeout := fs.Duration("turn-timeout", codex.DefaultTurnTimeout, "interrupt a turn that runs longer than this")
 	bin := fs.String("codex", "codex", "codex executable")
+	codexHome := fs.String("codex-home", "", "CODEX_HOME for the bridge's Codex (default: a bridge-only home holding just your login)")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
 	switch {
 	case fs.NArg() > 0:
-		return usageError("usage: threadsplice bridge codex [-as NAME] [-cwd DIR] [-sandbox read-only|workspace-write] [-thread ID | -new] [-max-depth N] [-turn-timeout 15m] [-codex PATH]")
+		return usageError("usage: threadsplice bridge codex [-as NAME] [-cwd DIR] [-sandbox read-only|workspace-write] [-thread ID | -new] [-max-depth N] [-turn-timeout 15m] [-codex PATH] [-codex-home DIR]")
 	case *sandbox != "read-only" && *sandbox != "workspace-write": // never danger-full-access for a remote peer
 		return usageError("-sandbox must be read-only or workspace-write")
 	case *fresh && *thread != "":
@@ -58,10 +59,15 @@ func cmdBridgeCodex(ctx context.Context, args []string) error {
 			return err
 		}
 	}
+	if *codexHome == "" {
+		if *codexHome, err = bridgeCodexHome(a.ID.Alias); err != nil {
+			return err
+		}
+	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	startCtx, cancelStart := context.WithTimeout(ctx, 2*time.Minute) // a resume reloads the thread's history
 	s, err := codex.Start(startCtx, codex.Options{Bin: *bin, Cwd: *cwd, Sandbox: *sandbox, ThreadID: *thread,
-		TurnTimeout: *turnTimeout, Version: version(), Log: log})
+		TurnTimeout: *turnTimeout, Version: version(), Home: *codexHome, Log: log})
 	cancelStart()
 	switch {
 	case err == nil:
@@ -97,6 +103,42 @@ func cmdBridgeCodex(ctx context.Context, args []string) error {
 		return s.Err()
 	}
 	return err
+}
+
+// bridgeCodexHome prepares a CODEX_HOME for the bridge alone: it holds only a
+// link to the user's login, so none of their MCP servers, plugins, hooks or
+// profiles load in a thread that remote peers drive. Codex rewrites auth.json
+// in place, so token refreshes reach the user's own file through the link.
+func bridgeCodexHome(alias string) (string, error) {
+	home, err := client.Home()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(home, "bridges", alias+".codex-home")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	user := os.Getenv("CODEX_HOME")
+	if user == "" {
+		h, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		user = filepath.Join(h, ".codex")
+	}
+	src, dst := filepath.Join(user, "auth.json"), filepath.Join(dir, "auth.json")
+	if _, err := os.Stat(src); err != nil {
+		return "", fmt.Errorf("no Codex login at %s: run `codex login` first. Logins kept in the system keyring can't be shared with the bridge; "+
+			"use the file store (cli_auth_credentials_store = \"file\" in config.toml) or pass -codex-home with a prepared CODEX_HOME", src)
+	}
+	if target, err := os.Readlink(dst); err == nil && target == src {
+		return dir, nil
+	}
+	os.Remove(dst)
+	if err := os.Symlink(src, dst); err != nil {
+		return "", fmt.Errorf("linking your Codex login into the bridge's CODEX_HOME: %w (on Windows, enable Developer Mode for symlinks, or pass -codex-home)", err)
+	}
+	return dir, nil
 }
 
 // codexState is what the bridge remembers per identity, so that a restart

@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/t0uh33d/threadsplice/internal/api"
 )
@@ -40,7 +41,20 @@ type StatusError struct {
 	Msg  string
 }
 
-func (e *StatusError) Error() string { return fmt.Sprintf("relay: %s (HTTP %d)", e.Msg, e.Code) }
+// Error keeps the relay's text to one short printable line: it can end up in
+// a tool result a model reads, and the relay is not trusted with that.
+func (e *StatusError) Error() string {
+	msg := strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) {
+			return r
+		}
+		return ' '
+	}, e.Msg)
+	if len(msg) > 200 {
+		msg = strings.ToValidUTF8(msg[:200], "") + "…"
+	}
+	return fmt.Sprintf("relay: %s (HTTP %d)", msg, e.Code)
+}
 
 // CheckRelayURL rejects relay URLs that would send bearer tokens in cleartext.
 // Plain http is allowed only for loopback, or when THREADSPLICE_INSECURE=1.

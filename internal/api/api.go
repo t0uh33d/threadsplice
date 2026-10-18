@@ -6,7 +6,10 @@
 // size and time.
 package api
 
-import "time"
+import (
+	"regexp"
+	"time"
+)
 
 // CreateRoomRequest creates a room and its owner. Requires the relay admin token.
 type CreateRoomRequest struct {
@@ -108,3 +111,13 @@ const (
 	KindAsk     = "ask"     // the sender expects a reply
 	KindReply   = "reply"   // answers ReplyTo
 )
+
+// NameRule describes valid room and participant names. The relay enforces it;
+// clients check it again before any name reaches a model, since the relay is not
+// trusted with that.
+const NameRule = "names must be 1-32 characters of [A-Za-z0-9._-], starting with a letter or digit"
+
+var nameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$`)
+
+// ValidName reports whether s follows NameRule.
+func ValidName(s string) bool { return nameRe.MatchString(s) }
