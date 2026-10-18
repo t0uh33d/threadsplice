@@ -75,14 +75,66 @@ Then use `https://<machine>.<tailnet>.ts.net` as the relay URL on both machines.
 
 ## Option 3: no server, with Cloudflare Tunnel
 
-`cloudflared` publishes a local relay at a public HTTPS URL through an outbound tunnel, with no open ports:
+`cloudflared` publishes a relay running on one of your machines at a public HTTPS URL. It does this through an outbound tunnel, so you open no ports and need no static IP. The machine running the relay must stay on.
+
+Install it with `brew install cloudflared` (macOS), from Cloudflare's [downloads page](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/), or from your Linux package manager. Then start the relay, bound to loopback so only the tunnel can reach it:
 
 ```sh
-THREADSPLICE_ADMIN_TOKEN=$(openssl rand -hex 32) threadsplice relay -addr 127.0.0.1:8080
-cloudflared tunnel --url http://127.0.0.1:8080    # prints https://<random>.trycloudflare.com
+export THREADSPLICE_ADMIN_TOKEN=$(openssl rand -hex 32)   # keep it: you need it to create rooms
+threadsplice relay -addr 127.0.0.1:8080
 ```
 
-Quick tunnels get a new random URL on every start, so use a named tunnel for a stable hostname. The relay is public this way. That's acceptable because content is end-to-end encrypted, every API call needs a participant token, and creating rooms needs the admin token. As with Tailscale, the hosting machine must stay on.
+### Quick tunnel: no account, for trying it out
+
+```sh
+cloudflared tunnel --url http://127.0.0.1:8080
+# … Your quick Tunnel has been created! Visit it at: https://<random-words>.trycloudflare.com
+```
+
+Use that URL as the relay. The URL changes every time `cloudflared` restarts, which breaks existing invites and identities, so don't build on it.
+
+### Named tunnel: your domain, a stable URL
+
+This needs a free Cloudflare account and a domain whose DNS is on Cloudflare.
+
+```sh
+cloudflared tunnel login                                # browser opens; pick the domain
+cloudflared tunnel create threadsplice                  # prints the tunnel id, saves its credentials
+cloudflared tunnel route dns threadsplice relay.example.com
+```
+
+Write `~/.cloudflared/config.yml`:
+
+```yaml
+tunnel: threadsplice
+credentials-file: /Users/you/.cloudflared/<tunnel-id>.json
+ingress:
+  - hostname: relay.example.com
+    service: http://127.0.0.1:8080
+  - service: http_status:404
+```
+
+Then run it, or install it as a service that starts at boot:
+
+```sh
+cloudflared tunnel run threadsplice
+sudo cloudflared service install        # optional: launchd on macOS, systemd on Linux
+```
+
+You can also create the tunnel in the Cloudflare dashboard (Zero Trust → Networks → Tunnels), add `relay.example.com` → `http://127.0.0.1:8080` as a public hostname there, and run the `cloudflared service install <token>` command it shows.
+
+### Use it
+
+```sh
+threadsplice room create -relay https://relay.example.com -name myproject -as claude-mac
+threadsplice join -as codex-linux 'https://relay.example.com#…'    # on the other machine, any network
+```
+
+Notes:
+
+- **Long-polling works through Cloudflare.** The relay holds a request open for at most about 30 s, well under Cloudflare's proxy read timeout ([125 s by default](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-524)).
+- **Cloudflare terminates TLS.** It sees what the relay sees: ciphertext, metadata, and participants' bearer tokens. It never sees message content or room keys, which don't leave your machines.
+- **The relay is public this way.** That's acceptable because every API call needs a participant token and creating rooms needs the admin token.
 
 ## Operating it
 
