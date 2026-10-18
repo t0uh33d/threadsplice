@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -65,12 +66,20 @@ func (a *Agent) Peers(ctx context.Context) ([]api.Participant, error) {
 		return nil, err
 	}
 	a.mu.Lock()
-	for _, p := range ps {
-		a.names[p.ID] = p.Name
+	for i, p := range ps {
+		// Names reach models (envelopes, notices); a relay is not trusted to
+		// keep them to its own naming rule.
+		if !peerName.MatchString(p.Name) {
+			ps[i].Name = "invalid-name-" + p.ID[:min(6, len(p.ID))]
+		}
+		a.names[p.ID] = ps[i].Name
 	}
 	a.mu.Unlock()
 	return ps, nil
 }
+
+// peerName is the relay's participant naming rule.
+var peerName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$`)
 
 func (a *Agent) name(id string) (string, bool) {
 	a.mu.Lock()
@@ -185,6 +194,16 @@ func (a *Agent) Inbox(ctx context.Context, wait time.Duration) ([]Message, error
 	return msgs, a.Ack(ctx, last)
 }
 
+// MaxAutoDepth is how many automatic ask/reply exchanges a chain may run
+// before agents are told (and bridges forced) to stop answering on their own.
+const MaxAutoDepth = 5
+
+// BridgeEnv is set in the environment of agents that a headless bridge drives.
+// This binary's own hooks and MCP server stand down when they see it, so a
+// user's global agent config can't make a bridge session re-point or read the
+// interactive identity's messages.
+const BridgeEnv = "THREADSPLICE_BRIDGE"
+
 // Envelope frames one message for delivery straight into an agent session —
 // a Claude Code inbox, a Codex turn, an ACP prompt — so the model sees who sent
 // it, that it is untrusted peer input, and how an answer gets back.
@@ -197,6 +216,8 @@ func Envelope(room string, m Message, autoReply bool) string {
 	switch {
 	case m.Kind != api.KindAsk:
 		b.WriteString("No reply is expected.\n")
+	case m.Depth >= MaxAutoDepth:
+		b.WriteString("This exchange has reached the automatic-reply limit: do not answer it unless your user asks you to.\n")
 	case autoReply:
 		fmt.Fprintf(&b, "Your final answer in this turn is sent back to %q automatically.\n", m.FromName)
 	default:

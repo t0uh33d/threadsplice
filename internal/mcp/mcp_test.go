@@ -2,12 +2,15 @@ package mcp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,7 +36,7 @@ func pair(t *testing.T) (alice, bob *client.Agent) {
 		t.Fatal(err)
 	}
 	key := e2ee.NewKey().String()
-	alice, _ = client.NewAgent(client.Identity{Relay: ts.URL, RoomID: m.RoomID, RoomName: "proj", ParticipantID: m.ParticipantID, Name: "alice", Owner: true, Token: m.Token, RoomKey: key})
+	alice, _ = client.NewAgent(client.Identity{Alias: "alice", Relay: ts.URL, RoomID: m.RoomID, RoomName: "proj", ParticipantID: m.ParticipantID, Name: "alice", Owner: true, Token: m.Token, RoomKey: key})
 	inv, err := alice.Relay.CreateInvite(ctx, m.RoomID, time.Hour)
 	if err != nil {
 		t.Fatal(err)
@@ -42,7 +45,7 @@ func pair(t *testing.T) (alice, bob *client.Agent) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bob, _ = client.NewAgent(client.Identity{Relay: ts.URL, RoomID: j.RoomID, RoomName: "proj", ParticipantID: j.ParticipantID, Name: "bob", Token: j.Token, RoomKey: key})
+	bob, _ = client.NewAgent(client.Identity{Alias: "bob", Relay: ts.URL, RoomID: j.RoomID, RoomName: "proj", ParticipantID: j.ParticipantID, Name: "bob", Token: j.Token, RoomKey: key})
 	return alice, bob
 }
 
@@ -51,21 +54,45 @@ type session struct {
 	in    io.Writer
 	lines chan map[string]any
 	id    int
+	logs  *syncBuf
 }
 
-func start(t *testing.T, a *client.Agent, channel bool) *session {
+type syncBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (w *syncBuf) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.Write(p)
+}
+
+func (w *syncBuf) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.b.String()
+}
+
+// start serves a on an in-process pipe with delivery mode deliver. The server
+// has fully stopped, delivery loop included, once the test's cleanup ran.
+func start(t *testing.T, a *client.Agent, deliver string) *session {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
+	logs := &syncBuf{}
+	opt := Options{Deliver: deliver, Version: "test", Log: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))}
 	done := make(chan struct{})
 	go func() {
-		Serve(ctx, a, inR, outW, Options{Channel: channel, Version: "test"})
+		if err := Serve(ctx, a, inR, outW, opt); err != nil {
+			t.Errorf("Serve: %v", err)
+		}
 		outW.Close()
 		close(done)
 	}()
 	t.Cleanup(func() { cancel(); inW.Close(); <-done })
-	s := &session{t: t, in: inW, lines: make(chan map[string]any, 64)}
+	s := &session{t: t, in: inW, lines: make(chan map[string]any, 64), logs: logs}
 	go func() {
 		sc := bufio.NewScanner(outR)
 		sc.Buffer(nil, 16<<20)
@@ -114,6 +141,21 @@ func (s *session) next(d time.Duration) map[string]any {
 	}
 }
 
+// initialize runs the MCP handshake as the client clientName and returns the
+// initialize result.
+func (s *session) initialize(clientName string) map[string]any {
+	s.t.Helper()
+	res := s.call("initialize", map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": clientName, "version": "x"}})
+	s.write(map[string]any{"method": "notifications/initialized"})
+	return res["result"].(map[string]any)
+}
+
+// tool calls a tool and returns its text, failing the test on a tool error.
+func (s *session) tool(name string, args map[string]any) string {
+	s.t.Helper()
+	return toolText(s.t, s.call("tools/call", map[string]any{"name": name, "arguments": args}))
+}
+
 func toolText(t *testing.T, resp map[string]any) string {
 	t.Helper()
 	res, ok := resp["result"].(map[string]any)
@@ -129,7 +171,7 @@ func toolText(t *testing.T, resp map[string]any) string {
 func TestChannelSession(t *testing.T) {
 	ctx := context.Background()
 	alice, bob := pair(t)
-	s := start(t, alice, true)
+	s := start(t, alice, "channel")
 
 	init := s.call("initialize", map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "claude-code", "version": "x"}})
 	res := init["result"].(map[string]any)
@@ -183,7 +225,7 @@ func TestChannelSession(t *testing.T) {
 func TestToolSession(t *testing.T) {
 	ctx := context.Background()
 	alice, bob := pair(t)
-	s := start(t, alice, false)
+	s := start(t, alice, "hold")
 	s.call("initialize", map[string]any{"protocolVersion": "1999-01-01"}) // unknown version: server offers its newest
 	s.write(map[string]any{"method": "notifications/initialized"})
 

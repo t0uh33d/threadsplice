@@ -42,9 +42,12 @@ Messaging:
   threadsplice inbox [-as NAME] [-wait 30s] [-json]          print and acknowledge new messages
 
 Agent integration:
-  threadsplice mcp [-as NAME] [-channel]                     MCP server (stdio) for Claude Code, Codex, Copilot...
-  threadsplice hook <event> [-as NAME]                       lifecycle hook handler (see docs)
-  threadsplice bridge <codex|acp> ...                        drive a headless agent session from the room
+  threadsplice setup <claude|codex|copilot|vscode> [-as NAME]   print the config that connects an agent
+  threadsplice mcp [-as NAME] [-deliver auto|claude|codex|channel|hold]
+                                                             MCP server (stdio): tools + live delivery
+  threadsplice hook <claude|codex|copilot> [event] [-as NAME]   lifecycle hook handler (JSON on stdin)
+  threadsplice bridge codex [-as NAME] [-cwd DIR] ...        headless Codex answering the room
+  threadsplice bridge acp [-as NAME] -- AGENT [ARGS...]      headless ACP agent (Copilot, Gemini, OpenCode...)
 
 Identity selection: -as NAME, else $THREADSPLICE_AS, else the only identity.
 Exit codes: 0 ok, 1 error, 2 usage.

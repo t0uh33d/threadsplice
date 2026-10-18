@@ -8,6 +8,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -23,7 +25,22 @@ type Session interface {
 }
 
 // DefaultMaxDepth stops automatic ask/reply chains after five exchanges.
-const DefaultMaxDepth = 5
+const DefaultMaxDepth = client.MaxAutoDepth
+
+// maxAnswer keeps a reply under the relay's sealed-message limit (128 KiB by
+// default) after JSON escaping and sealing overhead.
+const maxAnswer = 64 << 10
+
+// ChildEnv is the environment for an agent a bridge drives: ours, minus the
+// relay admin token, plus client.BridgeEnv so this binary's hooks and MCP
+// server stand down inside the bridge's session.
+func ChildEnv() []string {
+	env := slices.DeleteFunc(os.Environ(), func(kv string) bool {
+		k, _, _ := strings.Cut(kv, "=")
+		return strings.EqualFold(k, "THREADSPLICE_ADMIN_TOKEN") || strings.EqualFold(k, client.BridgeEnv)
+	})
+	return append(env, client.BridgeEnv+"=1")
+}
 
 // Options configures Run.
 type Options struct {
@@ -89,14 +106,23 @@ func handle(ctx context.Context, a *client.Agent, s Session, m client.Message, o
 	a.Relay.SetState(ctx, a.ID.RoomID, "busy")
 	answer, err := s.Turn(ctx, client.Envelope(a.ID.RoomName, m, true))
 	a.Relay.SetState(ctx, a.ID.RoomID, "idle")
+	if err != nil && ctx.Err() == nil {
+		opt.Log.Warn("turn failed", "id", m.ID, "err", err)
+	}
 	if !ask || ctx.Err() != nil {
 		return err
 	}
 	switch {
 	case err != nil:
-		answer = "[thread splice bridge] The agent could not complete this turn: " + err.Error()
+		reason := err.Error()
+		if len(reason) > 300 { // agent errors can carry local detail; peers get the gist
+			reason = strings.ToValidUTF8(reason[:300], "") + "…"
+		}
+		answer = "[thread splice bridge] The agent could not complete this turn: " + reason
 	case strings.TrimSpace(answer) == "":
 		answer = "[thread splice bridge] The agent finished the turn without a text answer."
+	case len(answer) > maxAnswer:
+		answer = strings.ToValidUTF8(answer[:maxAnswer], "") + "\n[thread splice bridge] Answer truncated to fit the relay's message size limit."
 	}
 	return reply(answer)
 }

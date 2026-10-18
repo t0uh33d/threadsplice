@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/t0uh33d/threadsplice/internal/api"
 	"github.com/t0uh33d/threadsplice/internal/client"
@@ -35,6 +36,24 @@ func (f *fakeSession) count() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.prompts)
+}
+
+func TestChildEnv(t *testing.T) {
+	t.Setenv("THREADSPLICE_ADMIN_TOKEN", "secret-admin-token")
+	t.Setenv("THREADSPLICE_BRIDGE", "0")
+	env := strings.Join(ChildEnv(), "\n")
+	if strings.Contains(env, "secret-admin-token") {
+		t.Error("admin token leaks into the bridged agent's environment")
+	}
+	if !strings.Contains(env, "THREADSPLICE_BRIDGE=1") || strings.Contains(env, "THREADSPLICE_BRIDGE=0") {
+		t.Error("bridge marker missing or duplicated")
+	}
+}
+
+type bigSession struct{}
+
+func (bigSession) Turn(context.Context, string) (string, error) {
+	return strings.Repeat("é", maxAnswer), nil // multi-byte: truncation must keep valid UTF-8
 }
 
 func TestBridge(t *testing.T) {
@@ -103,4 +122,26 @@ func TestBridge(t *testing.T) {
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Errorf("Run returned %v", err)
 	}
+
+	// An oversized answer is truncated to fit the relay instead of being lost.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	go Run(ctx2, bot, bigSession{}, Options{})
+	big, _ := asker.Send(ctx2, "codex", api.Payload{Kind: api.KindAsk, Text: "dump everything"})
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		msgs, err := asker.Inbox(ctx2, 2*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range msgs {
+			if r.ReplyTo == big {
+				if !strings.Contains(r.Text, "truncated") || !utf8.ValidString(r.Text) || len(r.Text) > maxAnswer+200 {
+					t.Fatalf("oversized answer: len %d, truncated note %v, valid %v", len(r.Text), strings.Contains(r.Text, "truncated"), utf8.ValidString(r.Text))
+				}
+				return
+			}
+		}
+	}
+	t.Fatal("no reply to the oversized answer")
 }

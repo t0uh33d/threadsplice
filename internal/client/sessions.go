@@ -54,7 +54,15 @@ func SaveSession(alias string, s SessionInfo) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), p)
+	// On Windows a rename over a file another process has open (the deliverer
+	// polls it) fails transiently; retry briefly.
+	for attempt := 0; ; attempt++ {
+		err = os.Rename(tmp.Name(), p)
+		if err == nil || attempt == 4 {
+			return err
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // LoadSession returns the live session recorded for alias, if any.
