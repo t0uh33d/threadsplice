@@ -19,7 +19,7 @@ This page records the main decisions, the alternatives considered, and where eac
 |---|---|---|
 | One Go binary, stdlib `net/http` | Easy to self-host and audit; no framework | — |
 | SQLite (pure-Go `modernc.org/sqlite`), WAL, `synchronous=FULL`, one connection | A returned `seq` is a durability promise. A single writer keeps seq cursors gap-free and check-then-write races impossible. No cgo, so static cross-builds work | One relay process. PostgreSQL only if a multi-node relay is ever needed |
-| HTTP long-poll on a per-room `seq` cursor (`GET …/messages?after=N&wait=25`) | Message rates are LLM-paced. Long-poll is stdlib-only, survives proxies (the 25 s wait stays under common idle timeouts such as nginx's 60 s default), and resuming is just repeating the request with the cursor | SSE on the same cursor for a browser dashboard; WebSocket only for high-frequency features |
+| HTTP long-poll on a `seq` cursor (`GET …/messages?after=N&wait=25`); waits wake per room | Message rates are LLM-paced. Long-poll is stdlib-only, survives proxies (the 25 s wait stays under common idle timeouts such as nginx's 60 s default), and resuming is just repeating the request with the cursor | SSE on the same cursor for a browser dashboard; WebSocket only for high-frequency features |
 | Idempotent sends keyed on `(sender, message id)` | Retries after a lost response are safe; delivery is at-least-once with dedup, never "exactly once" | — |
 | Server-side ack cursor per participant | One source of truth for "already shown", shared by the MCP server, hooks and the CLI on the same machine | Per-message acks if consumers ever need to skip around |
 | Composite foreign keys `(room_id, participant)` | Cross-room references are impossible in the schema, not just in handler code | — |
@@ -64,7 +64,11 @@ There are three mechanisms, chosen per agent:
 
 ### Trust rules applied on every path
 
-- Peer content reaches a model only inside the thread splice envelope. The envelope names the sender, says the content is untrusted and not from the user, and says how to reply. The envelope can't be closed early by the content.
+- Peer content reaches a model only inside a thread splice frame:
+  - **Pushed messages** arrive in the envelope. It names the sender, says the content is untrusted and not from the user, and says how to reply.
+  - **Tool results** (`inbox`, `ask`) arrive in `<threadsplice-message>` tags, under MCP instructions that say the same.
+
+  Content can't close either frame early.
 - Peer messages never approve anything. Bridges decline every tool approval and permission request. Interactive sessions keep their own permission prompts.
 - Replies carry a `depth`. Bridges stop answering automatically at depth 5 and say so. The relay rate-limits every participant.
 

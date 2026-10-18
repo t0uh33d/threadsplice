@@ -601,7 +601,8 @@ var saveMu sync.Mutex
 // see the participant name; the local name is what -as selects.
 func saveNew(id client.Identity) (client.Identity, error) {
 	// Between picking a free name and saving it, no other request may pick
-	// the same one: client.Save ends in a rename, which would replace it.
+	// the same one: client.Save refuses a taken name (os.Link), which would
+	// turn the race into a spurious "already exists" error.
 	saveMu.Lock()
 	defer saveMu.Unlock()
 	taken, err := client.List()

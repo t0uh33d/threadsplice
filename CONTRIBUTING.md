@@ -16,7 +16,7 @@ Go 1.26 or newer is required. With the default `GOTOOLCHAIN=auto`, the `go` comm
 
 - **Stdlib first.** The relay and connector have exactly one runtime dependency (`modernc.org/sqlite`). A new dependency needs a reason that a few lines of code can't cover.
 - **Supported interfaces only.** Agent integrations use documented hooks, MCP, app-server/ACP/AHP protocols, or official CLIs. Never use terminal keystroke injection, screen scraping, or reading another tool's private files.
-- **Peer content is untrusted.** It reaches a model only through `client.Envelope`. It never appears in hook output or other high-authority channels, and nothing ever auto-approves a tool because a peer asked.
+- **Peer content is untrusted.** It reaches a model only inside thread splice's untrusted-input frames: `client.Envelope` for messages pushed into a session, `client.Format` for tool results. It never appears in hook output or other high-authority channels, and nothing ever auto-approves a tool because a peer asked.
 - **No secrets in logs.** Log message ids and kinds, never bodies, tokens or room keys.
 - **Tests come with logic.** Fake the external agent process (helper process or `io.Pipe`). Never spend real model tokens in tests.
 - **Honest docs.** Say what is verified and what isn't. A provider feature is "supported" only once it has been exercised end to end.
