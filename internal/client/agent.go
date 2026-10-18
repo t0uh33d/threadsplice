@@ -88,6 +88,10 @@ func (a *Agent) Peers(ctx context.Context) ([]api.Participant, error) {
 var (
 	peerState = regexp.MustCompile(`^[a-z_]{0,16}$`)
 	messageID = regexp.MustCompile(`^[A-Za-z0-9_-]{0,64}$`)
+	// frameClose matches the closing tag of Format's frame in any letter case
+	// or spacing a model might still read as one.
+	// ponytail: ASCII only; Unicode look-alikes of < and / still get through.
+	frameClose = regexp.MustCompile(`(?i)<\s*/\s*(threadsplice-message)`)
 )
 
 func (a *Agent) name(id string) (string, bool) {
@@ -302,7 +306,7 @@ func Format(room string, msgs []Message) string {
 		}
 		fmt.Fprintf(&b, " depth=\"%d\" at=%q>\n%s\n</threadsplice-message>\n", m.Depth, m.At.Format(time.RFC3339),
 			// a peer must not be able to close the frame early and pose as the system
-			strings.ReplaceAll(m.Text, "</threadsplice-message", "<\\/threadsplice-message"))
+			frameClose.ReplaceAllString(m.Text, `<\/${1}`))
 	}
 	return b.String()
 }

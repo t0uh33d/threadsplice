@@ -495,6 +495,7 @@ func TestSetup(t *testing.T) {
 			"[mcp_servers.threadsplice]",
 			`command = "threadsplice"`,
 			`args = ["mcp", "-as", "alice"]`,
+			"tool_timeout_sec = 300", // waits run up to 240 s; an abandoned call loses what it fetched
 			`# default_tools_approval_mode = "approve"`,
 			"~/.codex/hooks.json",
 			`"SessionStart": [{"hooks": [{"type": "command", "command": "threadsplice hook codex -as alice", "timeout": 10}]}],`,

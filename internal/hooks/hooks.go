@@ -413,6 +413,8 @@ const codexSetup = `Codex CLI (paths are under $CODEX_HOME, ~/.codex by default)
     args = ["mcp", "-as", "NAME"]
     # Codex hands MCP servers only a few environment variables; pass these through.
     env_vars = ["THREADSPLICE_HOME", "THREADSPLICE_AS", "CODEX_HOME", "XDG_CONFIG_HOME", "THREADSPLICE_BRIDGE"]
+    # The tools can wait up to 240 s for replies; Codex's documented default limit is 60 s.
+    tool_timeout_sec = 300
     # Optional: let Codex use these tools without asking each time (sending included).
     # default_tools_approval_mode = "approve"
 
