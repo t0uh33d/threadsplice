@@ -5,4 +5,3 @@
 *.db-wal
 deploy/.env
 .vscode/
-context.md

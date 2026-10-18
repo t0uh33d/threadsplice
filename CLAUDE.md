@@ -85,6 +85,6 @@ CI runs vet, the race tests and `go build -trimpath` on Linux, macOS and Windows
 - **Tests fake the external agent.** The test binary re-runs itself as the fake (for example `-fake-acp-agent`), or the test uses `io.Pipe`. Tests never spend model tokens.
 - **Keep docs in step with the code.** Update the README Status table, and `docs/threat-model.md` when a boundary moves, in the same change.
 - **Naming.** Prose says "thread splice"; the binary and module say `threadsplice`.
-- **Never commit** `context.md`, `deploy/.env` or `*.db` files (all gitignored). The same goes for identity files and `.github/hooks/threadsplice.json`, which are not gitignored, so keep `THREADSPLICE_HOME` outside the repo.
+- **Never commit** `deploy/.env` or `*.db` files (both gitignored). The same goes for identity files and `.github/hooks/threadsplice.json`, which are not gitignored, so keep `THREADSPLICE_HOME` outside the repo.
 
 Live tests against a real Claude Code session spend model tokens; see [docs/live-testing.md](docs/live-testing.md).

@@ -498,12 +498,8 @@ func (s *server) renderHome(w http.ResponseWriter, code int, c createForm, j joi
 			p.Create.Relay = p.Nav[0].URL
 		}
 	}
-	if p.Create.Name == "" {
-		// The human's own name: agents get theirs when they're added.
-		if n := cmp.Or(os.Getenv("USER"), os.Getenv("USERNAME"), os.Getenv("LOGNAME")); api.ValidName(n) {
-			p.Create.Name = n
-		}
-	}
+	// The name field starts empty: every room member and the relay see the
+	// owner's name, so don't volunteer the OS login name.
 	p.Create.TTL = cmp.Or(p.Create.TTL, "24h")
 	s.render(w, code, "home", "layout", p)
 }
