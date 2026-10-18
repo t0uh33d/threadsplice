@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -85,12 +86,13 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 
+// Modes are the delivery modes Options.Deliver accepts.
+var Modes = []string{"auto", "claude", "codex", "channel", "hold"}
+
 // Serve runs the server until in is exhausted or ctx is cancelled.
 func Serve(ctx context.Context, a *client.Agent, in io.Reader, out io.Writer, opt Options) error {
-	switch opt.Deliver {
-	case "", "auto", "claude", "codex", "channel", "hold":
-	default:
-		return fmt.Errorf("unknown delivery mode %q (want auto, claude, codex, channel or hold)", opt.Deliver)
+	if opt.Deliver != "" && !slices.Contains(Modes, opt.Deliver) {
+		return fmt.Errorf("unknown delivery mode %q (want %s)", opt.Deliver, strings.Join(Modes, ", "))
 	}
 	if opt.Log == nil {
 		opt.Log = slog.New(slog.DiscardHandler)

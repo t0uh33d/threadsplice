@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -193,6 +195,93 @@ func TestRelayEndToEnd(t *testing.T) {
 	}
 	if _, err := alice.Send(ctx, "bob", api.Payload{Text: "x"}); err == nil {
 		t.Fatal("sent to revoked participant")
+	}
+}
+
+// The owner can watch the whole room, DMs between others included, without
+// consuming anyone's messages; nobody else can.
+func TestOwnerRoomLog(t *testing.T) {
+	ctx := context.Background()
+	ts := startRelay(t, filepath.Join(t.TempDir(), "relay.db"), 0)
+	ag := room(t, ts.URL, "proj", "human", "claude", "codex")
+	human, claude, codex := ag[0], ag[1], ag[2]
+
+	if _, err := claude.Send(ctx, "codex", api.Payload{Kind: api.KindAsk, Text: "private review request"}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, last, err := human.Log(ctx, 0, 0)
+	if err != nil || len(msgs) != 1 || msgs[0].Text != "private review request" || msgs[0].FromName != "claude" || msgs[0].ToName != "codex" || last != msgs[0].Seq {
+		t.Fatalf("owner log = %+v, last %d, %v", msgs, last, err)
+	}
+	// A non-owner's history has what it sent and received, never others' DMs.
+	if _, err := codex.Send(ctx, "", api.Payload{Kind: api.KindMessage, Text: "hello room"}); err != nil {
+		t.Fatal(err)
+	}
+	human.Send(ctx, "claude", api.Payload{Kind: api.KindMessage, Text: "for claude only"})
+	hist, _, err := codex.Log(ctx, 0, 0)
+	var texts []string
+	for _, m := range hist {
+		texts = append(texts, m.Text)
+	}
+	if err != nil || strings.Join(texts, "|") != "private review request|hello room" {
+		t.Fatalf("codex history = %q, %v (want what it got and sent, not human->claude)", texts, err)
+	}
+	if msgs, _, _ = human.Log(ctx, 0, 0); len(msgs) != 3 {
+		t.Fatalf("owner sees %d messages, want all 3", len(msgs))
+	}
+	last = msgs[len(msgs)-1].Seq
+	if _, err := human.Relay.Messages(ctx, human.ID.RoomID, -1, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := human.Relay.RoomLog(ctx, human.ID.RoomID, -1, 0); err != nil { // clamps to 0
+		t.Fatal(err)
+	}
+	// Watching must not have consumed codex's message.
+	if got, err := codex.Inbox(ctx, 0); err != nil || len(got) != 1 || got[0].Text != "private review request" {
+		t.Fatalf("codex inbox after owner watched = %+v, %v", got, err)
+	}
+	// A watcher long-polls the log too.
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		codex.Send(ctx, "claude", api.Payload{Kind: api.KindReply, Text: "lgtm"})
+	}()
+	start := time.Now()
+	msgs, _, err = human.Log(ctx, last, 5*time.Second)
+	if err != nil || len(msgs) != 1 || msgs[0].Text != "lgtm" || time.Since(start) > 3*time.Second {
+		t.Fatalf("log long-poll = %+v, %v after %v", msgs, err, time.Since(start))
+	}
+}
+
+// A participant who joins late must not get the retained history as a flood
+// of new messages, but can still read it.
+func TestLateJoinerStartsAtCursor(t *testing.T) {
+	ctx := context.Background()
+	ts := startRelay(t, filepath.Join(t.TempDir(), "relay.db"), 0)
+	ag := room(t, ts.URL, "proj", "alice", "bob")
+	for i := range 3 {
+		if _, err := ag[0].Send(ctx, "", api.Payload{Text: fmt.Sprint("old ", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ag[1].Inbox(ctx, 0) // bob consumes them
+	inv, err := ag[0].Relay.CreateInvite(ctx, ag[0].ID.RoomID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err := client.New(ts.URL, "").Join(ctx, inv.Token, "carol")
+	if err != nil {
+		t.Fatal(err)
+	}
+	carol := mustAgent(t, client.Identity{Relay: ts.URL, RoomID: j.RoomID, RoomName: "proj", ParticipantID: j.ParticipantID, Name: "carol", Token: j.Token, RoomKey: ag[0].ID.RoomKey})
+	if msgs, err := carol.Inbox(ctx, 0); err != nil || len(msgs) != 0 {
+		t.Fatalf("late joiner inbox = %d messages, %v (want none)", len(msgs), err)
+	}
+	if hist, _, err := carol.Log(ctx, 0, 0); err != nil || len(hist) != 3 {
+		t.Fatalf("late joiner history = %d, %v (want the 3 retained broadcasts)", len(hist), err)
+	}
+	ag[0].Send(ctx, "", api.Payload{Text: "new"})
+	if msgs, err := carol.Inbox(ctx, 0); err != nil || len(msgs) != 1 || msgs[0].Text != "new" {
+		t.Fatalf("late joiner after a new message = %+v, %v", msgs, err)
 	}
 }
 

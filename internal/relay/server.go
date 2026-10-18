@@ -29,7 +29,6 @@ type Config struct {
 	DBPath        string
 	AdminToken    string        // required to create rooms
 	Retention     time.Duration // messages older than this are deleted; 0 = 30 days
-	MaxSealed     int           // max sealed message size in bytes; 0 = 128 KiB
 	SendPerMinute int           // per-participant send rate limit; 0 = 60
 	Log           *slog.Logger
 }
@@ -38,6 +37,7 @@ const (
 	maxWait      = 30 * time.Second // long-poll cap; stays under common proxy idle timeouts
 	onlineWindow = 75 * time.Second // a participant counts as online if seen this recently
 	pageSize     = 100
+	maxSealed    = 128 << 10 // largest sealed message the relay accepts
 )
 
 // Server serves the relay API.
@@ -47,7 +47,16 @@ type Server struct {
 	hub   hub
 
 	mu    sync.Mutex
-	sends map[string]window // per-participant send counters
+	sends map[string]window   // per-participant send counters
+	pres  map[string]presence // per-participant presence
+}
+
+// presence is kept in memory: it changes on every poll, doesn't need to
+// survive a restart (agents re-report within one poll), and writing it to the
+// database would cost a sync on every request.
+type presence struct {
+	seen  time.Time
+	state string
 }
 
 type window struct {
@@ -63,9 +72,6 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Retention == 0 {
 		cfg.Retention = 30 * 24 * time.Hour
 	}
-	if cfg.MaxSealed == 0 {
-		cfg.MaxSealed = 128 << 10
-	}
 	if cfg.SendPerMinute == 0 {
 		cfg.SendPerMinute = 60
 	}
@@ -76,7 +82,7 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{cfg: cfg, store: st, hub: hub{ch: map[string]chan struct{}{}}, sends: map[string]window{}}, nil
+	return &Server{cfg: cfg, store: st, hub: hub{ch: map[string]chan struct{}{}}, sends: map[string]window{}, pres: map[string]presence{}}, nil
 }
 
 // Close closes the database.
@@ -260,12 +266,32 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request, c caller) 
 }
 
 func (s *Server) participants(w http.ResponseWriter, r *http.Request, c caller) {
-	ps, err := s.store.participants(r.Context(), c.room, onlineWindow)
+	ps, err := s.store.participants(r.Context(), c.room)
 	if err != nil {
 		s.internal(w, err)
 		return
 	}
+	s.mu.Lock()
+	for i, p := range ps {
+		pr := s.pres[p.ID]
+		if !pr.seen.IsZero() {
+			ps[i].LastSeen, ps[i].State = pr.seen.UTC().Truncate(time.Millisecond), pr.state
+		}
+		ps[i].Online = !p.Revoked && time.Since(pr.seen) < onlineWindow
+	}
+	s.mu.Unlock()
 	writeJSON(w, http.StatusOK, ps)
+}
+
+func (s *Server) touch(pid, state string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.pres[pid]
+	p.seen = time.Now()
+	if state != "" {
+		p.state = state
+	}
+	s.pres[pid] = p
 }
 
 func (s *Server) revoke(w http.ResponseWriter, r *http.Request, c caller) {
@@ -293,8 +319,8 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, c caller) {
 	case !validID(req.ID):
 		httpError(w, http.StatusBadRequest, "id must be 1-64 characters of [A-Za-z0-9_-]")
 		return
-	case len(req.Sealed) == 0 || len(req.Sealed) > s.cfg.MaxSealed:
-		httpError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("sealed message must be 1-%d bytes", s.cfg.MaxSealed))
+	case len(req.Sealed) == 0 || len(req.Sealed) > maxSealed:
+		httpError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("sealed message must be 1-%d bytes", maxSealed))
 		return
 	case req.To == c.id:
 		httpError(w, http.StatusBadRequest, "cannot send a message to yourself")
@@ -320,9 +346,20 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, c caller) {
 
 // messages long-polls: it returns as soon as anything is readable after the
 // cursor, or an empty page once `wait` (capped at 30s) elapses. Without
-// `after`, it resumes from the caller's last acknowledged seq.
+// `after`, it resumes from the caller's last acknowledged seq. With all=1 it
+// returns a read-only history from an explicit cursor, touching nobody's
+// acknowledgements: the whole room (direct messages between others included)
+// for the owner, and for anyone else what they may read plus what they sent.
 func (s *Server) messages(w http.ResponseWriter, r *http.Request, c caller) {
 	q := r.URL.Query()
+	all := q.Get("all") == "1"
+	v := inbox
+	switch {
+	case all && c.owner:
+		v = everyone
+	case all:
+		v = history
+	}
 	var after int64
 	var err error
 	if v := q.Get("after"); v != "" {
@@ -330,6 +367,9 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request, c caller) {
 			httpError(w, http.StatusBadRequest, "after must be a non-negative integer")
 			return
 		}
+	} else if all {
+		httpError(w, http.StatusBadRequest, "all=1 needs an explicit after cursor")
+		return
 	} else if after, err = s.store.ackedSeq(r.Context(), c.id); err != nil {
 		s.internal(w, err)
 		return
@@ -346,7 +386,7 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request, c caller) {
 	deadline := time.Now().Add(wait)
 	for {
 		woke := s.hub.wait(c.room)
-		msgs, err := s.store.messages(r.Context(), c.room, c.id, after, pageSize)
+		msgs, err := s.store.messages(r.Context(), c.room, c.id, after, pageSize, v)
 		if err != nil {
 			if r.Context().Err() == nil {
 				s.internal(w, err)
@@ -360,6 +400,11 @@ func (s *Server) messages(w http.ResponseWriter, r *http.Request, c caller) {
 		timer := time.NewTimer(time.Until(deadline))
 		select {
 		case <-woke:
+			if !s.store.active(r.Context(), c.id) { // revoked while waiting: deliver nothing more
+				timer.Stop()
+				httpError(w, http.StatusUnauthorized, "invalid or revoked credential")
+				return
+			}
 		case <-timer.C:
 		case <-r.Context().Done(): // client gone or relay shutting down
 			timer.Stop()
@@ -414,10 +459,7 @@ func (s *Server) auth(h func(http.ResponseWriter, *http.Request, caller)) http.H
 			httpError(w, http.StatusBadRequest, "state must be 1-16 characters of [a-z_]")
 			return
 		}
-		if err := s.store.touch(r.Context(), c.id, state); err != nil {
-			s.internal(w, err)
-			return
-		}
+		s.touch(c.id, state)
 		h(w, r, c)
 	}
 }

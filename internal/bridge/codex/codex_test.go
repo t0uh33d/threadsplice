@@ -313,7 +313,7 @@ func TestSession(t *testing.T) {
 	}
 }
 
-func TestRetryAndFallback(t *testing.T) {
+func TestRetryAndFailClosed(t *testing.T) {
 	f, ch := startFake(t, Options{Sandbox: "read-only"})
 	f.handshake()
 	s := f.session(ch)
@@ -324,12 +324,6 @@ func TestRetryAndFallback(t *testing.T) {
 	if get(req, "params", "toolOutput", "output") != "hi" {
 		t.Errorf("retry params = %v", req["params"])
 	}
-	f.fail(req, -32600, "Invalid request: unknown field `toolOutput`")
-	req = f.request("turn/start") // falls back to user text
-	want := []any{map[string]any{"type": "text", "text": "hi", "text_elements": []any{}}}
-	if get(req, "params", "toolOutput") != nil || !reflect.DeepEqual(get(req, "params", "input"), want) {
-		t.Errorf("fallback params = %v", req["params"])
-	}
 	f.reply(req, turnResp("turn_1"))
 	f.notify("turn/completed", map[string]any{"threadId": "thr_1", "turn": map[string]any{
 		"id": "turn_1", "status": "completed", "items": []any{agentMsg("hello", nil)}}})
@@ -337,15 +331,15 @@ func TestRetryAndFallback(t *testing.T) {
 		t.Fatalf("turn = %q, %v", r.text, r.err)
 	}
 
-	// The fallback sticks, and an error it can't help with is returned.
+	// A Codex that refuses toolOutput gets an error, never peer text as user input.
 	done = turn(s, "again")
-	req = f.request("turn/start")
-	if get(req, "params", "toolOutput") != nil {
-		t.Errorf("second turn retried toolOutput: %v", req["params"])
+	f.fail(f.request("turn/start"), -32600, "Invalid request: unknown field `toolOutput`")
+	if r := await(t, done); r.err == nil || !strings.Contains(r.err.Error(), "upgrade") {
+		t.Fatalf("turn = %q, %v; want an upgrade error", r.text, r.err)
 	}
-	f.fail(req, -32602, "Input exceeds the maximum length of 1048576 characters.")
-	if r := await(t, done); r.err == nil || !strings.Contains(r.err.Error(), "maximum length") {
-		t.Fatalf("turn = %q, %v; want the turn/start error", r.text, r.err)
+	done = turn(s, "third")
+	if req := f.request("turn/start"); get(req, "params", "toolOutput", "output") != "third" || len(get(req, "params", "input").([]any)) != 0 {
+		t.Errorf("later turn params = %v (must stay toolOutput with empty input)", req["params"])
 	}
 }
 
@@ -601,17 +595,12 @@ func TestUnexpectedInput(t *testing.T) {
 }
 
 func TestOldCodex(t *testing.T) {
-	// A Codex that predates toolOutput would ignore it and run an empty turn, so
-	// its version alone switches the session to text input.
+	// A Codex that predates toolOutput would ignore it and run an empty turn;
+	// the only fallback would give peer text user authority, so Start refuses.
 	f, ch := startFake(t, Options{Sandbox: "read-only"})
 	f.reply(f.request("initialize"), map[string]any{"userAgent": "threadsplice/0.150.2 (Ubuntu 24.4.0; x86_64) xterm-256color (threadsplice; dev)"})
-	f.next() // initialized
-	f.reply(f.request("thread/start"), map[string]any{"thread": map[string]any{"id": "thr_1"}})
-	s := f.session(ch)
-	turn(s, "hi")
-	req := f.request("turn/start")
-	if get(req, "params", "toolOutput") != nil || get(req, "params", "input") == nil || len(get(req, "params", "input").([]any)) != 1 {
-		t.Errorf("turn/start params = %v, want text input", req["params"])
+	if r := await(t, ch); r.err == nil || !strings.Contains(r.err.Error(), "upgrade to Codex 0.151") {
+		t.Fatalf("Start with Codex 0.150 = %v, want an upgrade error", r.err)
 	}
 
 	for ua, want := range map[string][]int{

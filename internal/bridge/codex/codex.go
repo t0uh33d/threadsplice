@@ -110,8 +110,7 @@ type Session struct {
 	events  []message     // item/completed and turn/completed seen during the current turn
 	wake    chan struct{} // nudged whenever events grows
 
-	turnMu    sync.Mutex
-	textInput bool // this Codex lacks toolOutput: send prompts as user text (set during Start, then under turnMu)
+	turnMu sync.Mutex
 
 	done      chan struct{} // closed once the app-server is gone
 	err       error         // why; set before done closes
@@ -197,8 +196,9 @@ func (s *Session) open(ctx context.Context) error {
 		UserAgent string `json:"userAgent"`
 	}
 	json.Unmarshal(res, &info)
+	// Fail closed: the only fallback would hand peer text user authority.
 	if v := codexVersion(info.UserAgent); v != nil && slices.Compare(v, minToolOutput) < 0 {
-		s.useText("this Codex predates turn/start toolOutput", "user_agent", info.UserAgent)
+		return fmt.Errorf("this Codex (%s) predates turn/start toolOutput: upgrade to Codex 0.151 or newer", info.UserAgent)
 	}
 	if err := s.write(message{Method: "initialized"}); err != nil {
 		return err
@@ -361,15 +361,11 @@ func (s *Session) Turn(ctx context.Context, prompt string) (string, error) {
 	}
 }
 
-// startTurn sends turn/start and returns the turn id. It retries while the
-// server is overloaded, and falls back once to plain user input if this Codex
-// predates toolOutput.
+// startTurn sends turn/start, with the peer message as tool output, and
+// returns the turn id. It retries while the server is overloaded.
 func (s *Session) startTurn(ctx context.Context, prompt string) (string, error) {
 	for attempt := 1; ; attempt++ {
 		p := map[string]any{"threadId": s.thread, "input": []any{}, "toolOutput": map[string]any{"name": "threadsplice", "output": prompt}}
-		if s.textInput {
-			p = map[string]any{"threadId": s.thread, "input": []any{map[string]any{"type": "text", "text": prompt, "text_elements": []any{}}}}
-		}
 		res, err := s.call(ctx, "turn/start", p)
 		var re *rpcError
 		switch {
@@ -390,19 +386,12 @@ func (s *Session) startTurn(ctx context.Context, prompt string) (string, error) 
 				return "", ctx.Err()
 			case <-time.After(client.Backoff(attempt)):
 			}
-		case !s.textInput && rejectsToolOutput(err):
-			s.useText("this Codex refuses turn/start toolOutput", "err", err)
+		case rejectsToolOutput(err):
+			return "", fmt.Errorf("codex turn/start: this Codex doesn't accept toolOutput (upgrade to 0.151 or newer): %w", err)
 		default:
 			return "", fmt.Errorf("codex turn/start: %w", err)
 		}
 	}
-}
-
-// useText switches this session to plain user text input for peer messages.
-func (s *Session) useText(why string, args ...any) {
-	s.textInput = true
-	s.opt.Log.Warn(why+" (it needs 0.151 or newer); sending peer messages as user input instead, "+
-		"which gives them user authority: upgrade Codex", args...)
 }
 
 // minToolOutput is the first Codex whose turn/start reads toolOutput. Older

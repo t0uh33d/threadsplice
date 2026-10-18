@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -162,11 +163,23 @@ func (c *Client) Messages(ctx context.Context, room string, after int64, wait ti
 	if after >= 0 {
 		q.Set("after", strconv.FormatInt(after, 10))
 	}
-	if wait > 0 {
-		q.Set("wait", strconv.Itoa(int(wait.Seconds())))
+	if wait > 0 { // round up: a sub-second remainder must still wait, not spin
+		q.Set("wait", strconv.Itoa(int(math.Ceil(wait.Seconds()))))
 	}
 	if state != "" {
 		q.Set("state", state)
+	}
+	var resp api.MessagesResponse
+	err := c.do(ctx, "GET", "/v1/rooms/"+room+"/messages?"+q.Encode(), nil, &resp)
+	return resp.Messages, err
+}
+
+// RoomLog long-polls the whole room after seq `after` — direct messages between
+// other members included. Owner only; it never touches acknowledgements.
+func (c *Client) RoomLog(ctx context.Context, room string, after int64, wait time.Duration) ([]api.Envelope, error) {
+	q := url.Values{"all": {"1"}, "after": {strconv.FormatInt(max(after, 0), 10)}}
+	if wait > 0 {
+		q.Set("wait", strconv.Itoa(int(math.Ceil(wait.Seconds()))))
 	}
 	var resp api.MessagesResponse
 	err := c.do(ctx, "GET", "/v1/rooms/"+room+"/messages?"+q.Encode(), nil, &resp)

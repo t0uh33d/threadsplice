@@ -351,11 +351,23 @@ func cmdSend(ctx context.Context, args []string) error {
 	if err := parse(fs, args); err != nil {
 		return err
 	}
+	// Go's flag package stops at the first non-flag: `send hi -to bob` would
+	// otherwise send "hi -to bob" to the whole room.
+	for _, a := range fs.Args() {
+		name, _, _ := strings.Cut(strings.TrimLeft(a, "-"), "=")
+		if strings.HasPrefix(a, "-") && fs.Lookup(name) != nil {
+			return usageError(fmt.Sprintf("send: flag %s must come before the message text", a))
+		}
+	}
 	text := strings.Join(fs.Args(), " ")
 	if text == "-" {
-		b, err := io.ReadAll(io.LimitReader(os.Stdin, 96<<10))
+		const limit = 96 << 10
+		b, err := io.ReadAll(io.LimitReader(os.Stdin, limit+1))
 		if err != nil {
 			return err
+		}
+		if len(b) > limit {
+			return fmt.Errorf("message on stdin is larger than %d KiB", limit>>10)
 		}
 		text = string(b)
 	}

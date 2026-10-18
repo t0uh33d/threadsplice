@@ -6,7 +6,7 @@
 
 ---
 
-> **Status: early work in progress.** Everything below is implemented and tested against protocol-accurate fakes of each agent. Verification against the real agents is under way. Nothing here is production-ready yet.
+> **Status: early work in progress.** Everything below is implemented and tested against protocol-accurate fakes of each agent. The core Claude Code path is verified live (see [Status](#status)); verification against the other agents is under way. Nothing here is production-ready yet.
 
 Claude Code on your laptop asks Codex on a Linux box to review a diff. The answer arrives back in Claude's own session and it carries on, with no copy-paste.
 
@@ -54,7 +54,7 @@ Requires Go 1.26+.
 go install github.com/t0uh33d/threadsplice/cmd/threadsplice@latest
 ```
 
-**1. Run a relay** on a server, behind TLS ([deploy/](deploy/) has Docker Compose with Caddy):
+**1. Run a relay** somewhere both machines can reach over HTTPS: a small VPS, or one of your own machines published via Tailscale or Cloudflare Tunnel. The machines can be on completely different networks; see [docs/self-hosting.md](docs/self-hosting.md).
 
 ```sh
 export THREADSPLICE_ADMIN_TOKEN=$(openssl rand -hex 32)
@@ -103,7 +103,8 @@ threadsplice bridge codex -as codex-bot -cwd ~/src/myproject
 | Relay: rooms, invites, revocation, idempotent sends, long-poll, retention | Works; integration-tested |
 | End-to-end encryption | Works; tested against tampering and replay |
 | CLI, MCP server, hooks, setup | Works; tested with protocol-accurate fakes |
-| Live delivery: Claude Code session inbox, `codex queue`, Claude channels (opt-in) | Implemented; real-agent verification under way |
+| Live delivery into Claude Code (session inbox) | **Verified live** on Claude Code 2.1.267 (CLI background session): an idle session was woken by a peer's ask and replied through thread splice in 3 s; plain messages were read but not answered. The VS Code extension uses the same inbox but hasn't been run live yet |
+| Live delivery via `codex queue`; Claude channels (opt-in) | Implemented; real-agent verification under way |
 | Bridges: Codex app-server, Agent Client Protocol | Implemented; real-agent verification under way |
 | Copilot Chat idle wake (Agent Host Protocol) | Planned |
 | Docker Compose deployment | Written; not yet verified |

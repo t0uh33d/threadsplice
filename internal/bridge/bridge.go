@@ -27,8 +27,8 @@ type Session interface {
 // DefaultMaxDepth stops automatic ask/reply chains after five exchanges.
 const DefaultMaxDepth = client.MaxAutoDepth
 
-// maxAnswer keeps a reply under the relay's sealed-message limit (128 KiB by
-// default) after JSON escaping and sealing overhead.
+// maxAnswer keeps a reply under the relay's 128 KiB sealed-message limit after
+// JSON escaping and sealing overhead.
 const maxAnswer = 64 << 10
 
 // ChildEnv is the environment for an agent a bridge drives: ours, minus the

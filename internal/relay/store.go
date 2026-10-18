@@ -157,8 +157,12 @@ func (s *store) join(ctx context.Context, inviteHash []byte, name string, tokenH
 		if _, err := tx.ExecContext(ctx, `UPDATE invites SET used_at = ? WHERE token_hash = ?`, now, inviteHash); err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO participants (id, room_id, name, token_hash, created_at) VALUES (?, ?, ?, ?, ?)`,
-			m.ParticipantID, m.RoomID, name, tokenHash, now)
+		// A newcomer starts at the room's current cursor: retained history is
+		// readable via the history view, but must not arrive as a flood of new
+		// messages (each one would wake the joining agent's session).
+		_, err = tx.ExecContext(ctx, `INSERT INTO participants (id, room_id, name, token_hash, acked_seq, created_at)
+			VALUES (?, ?, ?, ?, (SELECT coalesce(max(seq), 0) FROM messages WHERE room_id = ?), ?)`,
+			m.ParticipantID, m.RoomID, name, tokenHash, m.RoomID, now)
 		return err
 	})
 	return m, err
@@ -180,34 +184,29 @@ func (s *store) auth(ctx context.Context, tokenHash []byte) (caller, error) {
 	return c, err
 }
 
-func (s *store) touch(ctx context.Context, pid, state string) error {
-	if state == "" {
-		_, err := s.db.ExecContext(ctx, `UPDATE participants SET last_seen = ? WHERE id = ?`, ms(time.Now()), pid)
-		return err
-	}
-	_, err := s.db.ExecContext(ctx, `UPDATE participants SET last_seen = ?, state = ? WHERE id = ?`, ms(time.Now()), state, pid)
-	return err
+// active reports whether pid is still a non-revoked participant.
+func (s *store) active(ctx context.Context, pid string) bool {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM participants WHERE id = ? AND revoked_at IS NULL`, pid).Scan(&n)
+	return err == nil && n == 1
 }
 
-func (s *store) participants(ctx context.Context, roomID string, online time.Duration) ([]api.Participant, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, owner, state, last_seen, acked_seq, revoked_at IS NOT NULL
+// participants lists a room's members. Presence (state, last seen) is filled
+// in by the server from memory; the schema's state and last_seen columns are
+// unused since presence moved there.
+func (s *store) participants(ctx context.Context, roomID string) ([]api.Participant, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, owner, acked_seq, revoked_at IS NOT NULL
 		FROM participants WHERE room_id = ? ORDER BY created_at`, roomID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	cutoff := ms(time.Now().Add(-online))
 	var out []api.Participant
 	for rows.Next() {
 		var p api.Participant
-		var seen int64
-		if err := rows.Scan(&p.ID, &p.Name, &p.Owner, &p.State, &seen, &p.AckedSeq, &p.Revoked); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.Owner, &p.AckedSeq, &p.Revoked); err != nil {
 			return nil, err
 		}
-		if seen > 0 {
-			p.LastSeen = time.UnixMilli(seen).UTC()
-		}
-		p.Online = !p.Revoked && seen >= cutoff
 		out = append(out, p)
 	}
 	return out, rows.Err()
@@ -253,12 +252,29 @@ func (s *store) insertMessage(ctx context.Context, roomID, from, to, id string, 
 	return seq, true, err
 }
 
-// messages returns what `me` may read after seq `after`: room-wide messages and
-// messages addressed to `me`, excluding its own.
-func (s *store) messages(ctx context.Context, roomID, me string, after int64, limit int) ([]api.Envelope, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT seq, id, sender_id, coalesce(recipient_id, ''), sealed, created_at FROM messages
-		WHERE room_id = ? AND seq > ? AND sender_id <> ? AND (recipient_id IS NULL OR recipient_id = ?)
-		ORDER BY seq LIMIT ?`, roomID, after, me, me, limit)
+// view selects which messages a reader gets.
+type view int
+
+const (
+	inbox    view = iota // room-wide and addressed to me, not my own: what agents consume
+	history              // inbox plus what I sent: a participant's full view
+	everyone             // every message in the room: the owner's audit view
+)
+
+// messages returns the messages after seq `after` that `me` gets in view v.
+// Callers enforce that only the owner asks for everyone.
+func (s *store) messages(ctx context.Context, roomID, me string, after int64, limit int, v view) ([]api.Envelope, error) {
+	const cols = `SELECT seq, id, sender_id, coalesce(recipient_id, ''), sealed, created_at FROM messages `
+	q, args := cols+`WHERE room_id = ? AND seq > ? AND sender_id <> ? AND (recipient_id IS NULL OR recipient_id = ?) ORDER BY seq LIMIT ?`,
+		[]any{roomID, after, me, me, limit}
+	switch v {
+	case history:
+		q, args = cols+`WHERE room_id = ? AND seq > ? AND (recipient_id IS NULL OR recipient_id = ? OR sender_id = ?) ORDER BY seq LIMIT ?`,
+			[]any{roomID, after, me, me, limit}
+	case everyone:
+		q, args = cols+`WHERE room_id = ? AND seq > ? ORDER BY seq LIMIT ?`, []any{roomID, after, limit}
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
