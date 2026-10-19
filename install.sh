@@ -161,9 +161,12 @@ main() {
 		;;
 	*) say "" "$dir isn't on your PATH. To add it, put this line in your shell's startup file (~/.zshrc, ~/.bashrc):" "  export PATH=\"$dir:\$PATH\"" ;;
 	esac
-	say "" "Next steps:" \
-		"  $cmd join            # paste the invite when asked" \
-		"  $cmd setup claude    # print the config for Claude Code (or codex, copilot, vscode)"
+	# The hints go above the commands, never after them: pasted into zsh, whose
+	# default has no interactive comments, "# ..." would become arguments.
+	say "" "Next, join a room (join asks for the invite), then print the config that connects" \
+		"Claude Code (or codex, copilot or vscode in place of claude):" \
+		"  $cmd join" \
+		"  $cmd setup claude"
 
 	[ "$join" = true ] || return 0
 	# Under curl | sh, stdin is this script, so join has to read the terminal.

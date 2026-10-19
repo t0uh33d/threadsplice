@@ -427,6 +427,14 @@ html:not([data-os]) .hint kbd + kbd::before { content: " / "; }
 /* Quiet until aimed at: red is for the removal itself, in the dialog. */
 .btn.remove { min-height: 32px; padding: 0 8px; border-color: transparent; background: transparent; color: var(--text-2); font-size: 0.8125rem; font-weight: 600; }
 .btn.remove:hover, .btn.remove:focus-visible { border-color: var(--danger); color: var(--danger); background: var(--danger-tint); }
+/* Where a pointer can aim, Remove waits at the row's end until it does, so a name gets the row's full width:
+   beside the button, "mac.demo-repo" would break at its hyphen. Touch keeps the button in the row. */
+@media (hover: hover) and (pointer: fine) {
+  .mrow { position: relative; }
+  /* The name it covers meanwhile fades out under its left edge; the dialog names the member in full. */
+  .mrow > .remove { position: absolute; top: 8px; right: 6px; opacity: 0; background: var(--side); box-shadow: -14px 0 10px -4px var(--side); }
+  .mrow:hover > .remove, .mrow > .remove:focus-visible { opacity: 1; }
+}
 .alone { margin: 8px 6px 0; }
 .removed { margin-top: 12px; padding: 0 6px; }
 .removed summary, .more summary { min-height: 32px; display: flex; align-items: center; gap: 4px; color: var(--text-2); font-size: 0.8125rem; font-weight: 600; cursor: pointer; }
@@ -557,15 +565,23 @@ dialog.confirm p { color: var(--text-2); }
     border: 1px solid var(--sep); border-radius: 16px; background: var(--elevated); box-shadow: var(--shadow-lg);
   }
   .sw-menu .side-actions { grid-template-columns: 1fr 1fr; padding: 0 4px; }
-  .room { height: auto; min-height: calc(100dvh - 57px); }
+  :root { --bar: 57px; } /* the top bar's height, which the room's toolbar sticks under */
+  .room { height: auto; min-height: calc(100dvh - var(--bar)); }
   .scroll { overflow: visible; }
   .scroll-in { padding: 16px 16px 12px; }
-  .room-head { padding: 14px 16px; }
+  .msg { scroll-margin-top: calc(var(--bar) + 72px); } /* a quote's jump lands below both bars */
+  /* The page scrolls as a whole here, so the room's actions become a toolbar stuck under the top bar.
+     The header's own box goes (display: contents): a sticky element only sticks within its parent. */
+  .room-head { display: contents; }
+  .room-id { flex: none; padding: 14px 16px 6px; }
   .room-head h1 { font-size: 1.25rem; }
-  /* Two quiet buttons side by side, the primary across under them: tidy at any width, and in DOM order. */
-  .room-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr)); flex: 1 1 100%; }
-  .room-actions .btn { padding: 0 12px; }
-  .room-actions .primary { grid-column: 1 / -1; }
+  .room-actions {
+    position: sticky; top: var(--bar); z-index: 15; flex: none; display: flex; flex-wrap: wrap; gap: 8px;
+    padding: 8px 16px; border-bottom: 1px solid var(--sep); background: var(--bg);
+  }
+  .room-actions .btn { flex: 1 1 0; padding: 0 10px; }
+  /* One row: "Invite" and "Connect" show; the rest of each label stays for screen readers. */
+  .room-actions .long { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   .dock { position: sticky; bottom: 0; z-index: 10; padding: 8px 8px calc(8px + env(safe-area-inset-bottom)); }
   .bubble { max-width: 88%; }
   .page { padding: 20px 16px 48px; }
@@ -595,6 +611,7 @@ dialog.confirm p { color: var(--text-2); }
 
 /* ---- coarse pointers: 44 px targets ---- */
 @media (pointer: coarse) {
+  :root { --bar: 61px; } /* the top bar's brand and switcher grow to 44 px */
   .btn, .btn.small, .btn.remove, .btn.send, .copy.icon, .newpill, .tabs a, .removed summary, .more summary, .crumb a, .quote,
   .brand, .skip, .switcher summary { min-height: 44px; }
   .btn.icon, .copy.icon { min-width: 44px; }

@@ -26,12 +26,15 @@
       <h2><span class="num" aria-hidden="true">3</span>In the chat you want to connect, say:</h2>
       <div class="code-block"><div class="code-head"><span>Claude chat</span>{{template "copy"}}</div><pre class="one">{{.Phrase}}</pre></div>
       <ul class="facts">
-        <li>That session joins as <strong>{{.Room.Name}}.reviewer</strong>, once you allow it in Claude's permission prompt.</li>
+        <li>That session joins as <strong>{{.Room.Name}}.reviewer</strong>, once you approve it in Claude's permission prompt. Claude asks for every join, whatever its permission mode.</li>
         <li>Without “as …”, it's named after the repo or folder it runs in, like <strong>{{.Room.Name}}.myproject</strong>.</li>
         <li>Other sessions on this machine stay out until you ask them too.</li>
         <li>A joined session you resume later rejoins by itself. To take one out, say “leave the thread splice room”.</li>
         {{- if .NameRoom}}
         <li>This machine is in more than one room, so the phrase names this one.</li>
+        {{- end}}
+        {{- if .NameMachine}}
+        <li>Sessions could join this room under more than one of this machine's memberships, so the phrase names this one: <strong>{{.Room.Alias}}</strong>.</li>
         {{- end}}
       </ul>
     </li>
@@ -55,7 +58,7 @@
 </div>
 {{end}}
 
-{{define "sessions"}}<div id="sessions" class="sessions" hx-get="/r/{{.Room.Alias}}/sessions" hx-trigger="every 3s" hx-swap="outerHTML" data-names="{{range .Sessions}}{{.Name}} {{end}}">
+{{define "sessions"}}<div id="sessions" class="sessions"{{if not .Gone}} hx-get="/r/{{.Room.Alias}}/sessions" hx-trigger="every 3s" hx-swap="outerHTML"{{end}} data-names="{{range .Sessions}}{{.Name}} {{end}}">
 {{- if .Err}}<p class="error" role="alert">{{.Err}}</p>{{end}}
 {{- with .Sessions}}<ul class="tree">{{range .}}<li class="member session">{{template "member" .}}</li>{{end}}</ul>
 {{- else}}{{if not .Err}}<p class="empty-line">None yet. They appear here as soon as a session joins.</p>{{end}}{{end}}

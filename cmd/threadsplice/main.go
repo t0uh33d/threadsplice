@@ -25,6 +25,7 @@ import (
 	"github.com/t0uh33d/threadsplice/internal/api"
 	"github.com/t0uh33d/threadsplice/internal/client"
 	"github.com/t0uh33d/threadsplice/internal/e2ee"
+	"github.com/t0uh33d/threadsplice/internal/hooks"
 	"github.com/t0uh33d/threadsplice/internal/relay"
 )
 
@@ -60,18 +61,24 @@ Agent integration:
 
 Identity selection: -as NAME, else $THREADSPLICE_AS, else the only identity. A session member is
 MACHINE/MEMBER (see identities). room create and join name this machine's membership after its
-kind (mac, linux, wsl, windows) unless -as says otherwise.
+kind (mac, linux, wsl, windows); room create -as picks another name. join -as NAME instead adds
+a fixed identity for one agent (Codex, Copilot, a bridge): see threadsplice setup.
 Claude Code without -as joins rooms one session at a time: see threadsplice setup claude.
-Exit codes: 0 ok, 1 error, 2 usage.
+Exit codes: 0 ok, 1 error, 2 usage, 130 interrupted (Ctrl-C).
 `
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	err := run(ctx, os.Args[1:])
+	interrupted := ctx.Err() != nil // before stop, which cancels ctx as well
 	stop()
 	var ue usageError
 	switch {
 	case err == nil:
+	case interrupted && errors.Is(err, context.Canceled):
+		// Ctrl-C ended a wait, such as join's invite prompt: "context
+		// canceled" would tell the user nothing they don't know.
+		os.Exit(130)
 	case errors.As(err, &ue):
 		fmt.Fprintf(os.Stderr, "threadsplice: %v\nRun 'threadsplice help' for usage.\n", err)
 		os.Exit(2)
@@ -221,8 +228,14 @@ func cmdRoomCreate(ctx context.Context, args []string) error {
 	return nil
 }
 
-// nextStep follows room create and join.
+// nextStep follows room create, and join without -as.
 const nextStep = "Next, connect Claude Code on this machine (once): threadsplice setup claude"
+
+// fixedStep, with the identity's local name, follows join -as. It keeps
+// Claude Code out of it: one identity for all its sessions is what session
+// members replace.
+const fixedStep = "Next, set up the agent that uses this identity: threadsplice setup <codex|copilot|vscode> -as %s\n" +
+	"Claude Code sessions don't need it: they join one at a time (threadsplice setup claude).\n"
 
 // localName picks the local name of a new machine membership whose name the
 // user didn't choose: its participant name, or, when this machine already
@@ -286,19 +299,33 @@ func printInvite(ctx context.Context, id client.Identity, ttl time.Duration) err
 	}
 	// The invite is printed on its own, and the other machine reads it at a
 	// prompt: in a command line it would land in shell history and the
-	// process list.
+	// process list. Each command has a line of its own, with no "# …" after
+	// it: zsh's default (no interactive comments) would run that as arguments.
 	fmt.Printf(`
 Invite (single use, expires %s). It contains the room key: share it privately.
 
   %s
 
-On the other machine:
-  curl -fsSL https://github.com/t0uh33d/threadsplice/releases/latest/download/install.sh | sh
-  threadsplice join          # paste the invite when asked
-(or: go install github.com/t0uh33d/threadsplice/cmd/threadsplice@latest)
-
-`, inv.ExpiresAt.Local().Format(time.RFC1123), client.FormatInvite(id.Relay, inv.Token, key))
+On the other machine, install thread splice, then join (it asks for the invite):
+%s`, inv.ExpiresAt.Local().Format(time.RFC1123), client.FormatInvite(id.Relay, inv.Token, key), installSteps(hooks.Released(version())))
 	return nil
+}
+
+const (
+	installScript = "curl -fsSL https://github.com/t0uh33d/threadsplice/releases/latest/download/install.sh | sh"
+	goInstall     = "go install github.com/t0uh33d/threadsplice/cmd/threadsplice@latest"
+)
+
+// installSteps is how the other machine installs thread splice and joins.
+// The installer script is a release asset, which exists for sure only when
+// this binary is a release's (see hooks.Released); until then go install
+// comes first.
+func installSteps(released bool) string {
+	first, other, alt := goInstall, "Without Go (from the first release on), install it with:", installScript
+	if released {
+		first, other, alt = installScript, "Or install it with Go:", goInstall
+	}
+	return "  " + first + "\n  threadsplice join\n" + other + "\n  " + alt + "\n\n"
 }
 
 // inviteToken is the shape of the invite tokens the relay mints (base64url).
@@ -308,7 +335,7 @@ const joinUsage = "usage: threadsplice join [-as NAME] [INVITE] (without INVITE,
 
 func cmdJoin(ctx context.Context, args []string) error {
 	fs := flags("join")
-	as := fs.String("as", "", "this machine's participant name in the room (default "+client.DefaultMachineName()+")")
+	as := fs.String("as", "", "a fixed identity for one agent, instead of this machine's membership ("+client.DefaultMachineName()+")")
 	pos, err := parseMixed(fs, args)
 	if err != nil {
 		return err
@@ -349,13 +376,21 @@ func cmdJoin(ctx context.Context, args []string) error {
 			return err
 		}
 	}
+	// Only the default name makes this machine's membership, which Claude Code
+	// sessions join under. A name given with -as is one agent's fixed identity
+	// (Codex's, say): marked as the machine's too, it would leave every session
+	// two memberships in the room to choose from, and join would ask which.
 	id := client.Identity{Alias: alias, Relay: relayURL, RoomID: m.RoomID, RoomName: m.RoomName,
-		ParticipantID: m.ParticipantID, Name: name, Machine: true, Token: m.Token, RoomKey: key.String()}
+		ParticipantID: m.ParticipantID, Name: name, Machine: defaulted, Token: m.Token, RoomKey: key.String()}
 	if err := client.Save(id); err != nil {
 		return err
 	}
 	fmt.Printf("Joined room %q as %q%s.\n", m.RoomName, name, savedAs(id))
-	fmt.Println(nextStep)
+	if defaulted {
+		fmt.Println(nextStep)
+	} else {
+		fmt.Printf(fixedStep, id.Alias)
+	}
 	return nil
 }
 

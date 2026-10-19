@@ -18,6 +18,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -327,6 +328,16 @@ func announce(alias, sid string, seq int64) error {
 // SetupTargets are the agents Setup has instructions for.
 var SetupTargets = []string{"claude", "codex", "copilot", "vscode"}
 
+var releaseTag = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`)
+
+// Released reports whether version, a build's module version, is a release
+// tag such as v0.1.0. Invites from such a build lead with the installer
+// script, which that tag's release published at releases/latest. Any other
+// build (Go stamps those with a pseudo-version, or "(devel)") can't tell
+// whether a release exists yet, so it leads with go install. Pre-releases
+// don't count: releases/latest skips them.
+func Released(version string) bool { return releaseTag.MatchString(version) }
+
 // Setup returns the configuration that connects target (see SetupTargets) to
 // thread splice as identity alias, for the user to add by hand; ok is false for
 // an unknown target. Keys and paths follow each agent's documentation as of
@@ -458,7 +469,8 @@ const claudeSessionSetupEnd = `
 
     join the thread splice room as reviewer
 
-   Claude asks to run the join tool; allow it. The session then joins as EXAMPLE
+   Claude Code asks you to approve the join, every time and in every permission mode (dontAsk
+   mode refuses it), so nothing joins a session behind your back. The session then joins as EXAMPLE
    (this machine's name in the room, a dot, and the label you gave). Without "as ...", the label is
    the repository's or the folder's name. Messages for that member arrive in that session by
    themselves; other sessions on this machine stay out until you ask them to join too. Saying
@@ -550,7 +562,9 @@ enter a session leave this machine. To keep sessions local, set "remote": "off" 
 const vscodeSetup = `VS Code
 
 Claude Code extension: it uses Claude Code's own settings and MCP servers, so follow
-threadsplice setup claude -as NAME (all but the channel option, which is terminal only).
+threadsplice setup claude: each session you pick then joins a room as a member of its own.
+(To give all sessions one shared identity instead, follow threadsplice setup claude -as <name>,
+all but its channel option, which is terminal only.)
 
 GitHub Copilot agent mode:
 

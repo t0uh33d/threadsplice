@@ -418,6 +418,58 @@ func TestSessionResume(t *testing.T) {
 	}
 }
 
+// Claude Code asks the user for every join, whatever the permission mode: the
+// join tool says so in its _meta. leave needs no such consent.
+func TestSessionJoinNeedsTheUser(t *testing.T) {
+	machineRoom(t)
+	s, _ := startSession(t, os.Getpid(), "s-consent", "", t.TempDir())
+	for _, tl := range s.call("tools/list", map[string]any{})["result"].(map[string]any)["tools"].([]any) {
+		tool := tl.(map[string]any)
+		meta, _ := tool["_meta"].(map[string]any)
+		switch flagged := meta["anthropic/requiresUserInteraction"] == true; {
+		case tool["name"] == "join" && !flagged:
+			t.Errorf("join isn't marked as needing the user: %v", tool)
+		case tool["name"] != "join" && meta != nil:
+			t.Errorf("%v carries _meta: %v", tool["name"], meta)
+		}
+	}
+}
+
+// The SessionStart hook can record the conversation before initialize: after
+// `claude --continue` the server may be handed the startup id while the hook
+// already knows the resumed one. Its record stands. One left by an earlier
+// process with the same pid, older than this process's inbox socket, doesn't.
+func TestSessionKeepsTheHooksRecord(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		socketAge time.Duration // how long before now the process (its socket) started
+		want      string
+	}{
+		{"hook ran first", time.Hour, "s-resumed"},
+		{"earlier process", -time.Minute, "s-startup"}, // the socket is newer than the record
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			machineRoom(t)
+			sock := filepath.Join(t.TempDir(), "inbox.sock") // a plain file dates the process just as well
+			if err := os.WriteFile(sock, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			at := time.Now().Add(-c.socketAge)
+			if err := os.Chtimes(sock, at, at); err != nil {
+				t.Fatal(err)
+			}
+			pid := livePID(t)
+			if err := client.SetCurrent(pid, "s-resumed"); err != nil {
+				t.Fatal(err)
+			}
+			startSession(t, pid, "s-startup", sock, t.TempDir())
+			if sid, _ := client.Current(pid); sid != c.want {
+				t.Errorf("the process shows %q, want %q", sid, c.want)
+			}
+		})
+	}
+}
+
 // /clear starts a new conversation in the same process: the SessionStart hook
 // records it and moves the binding, and the session stays joined.
 func TestSessionClear(t *testing.T) {
@@ -577,6 +629,32 @@ func TestSessionJoinPicksMachine(t *testing.T) {
 	}
 	if got := s.tool("join", map[string]any{"room": "proj"}); !strings.HasPrefix(got, `Joined room "proj" as "mac.repo".`) {
 		t.Errorf("join room=proj: %s", got)
+	}
+
+	// Two machine memberships in one room: room=… can't tell them apart, machine=… can.
+	twin := mac.ID
+	twin.Alias = "mac-twin"
+	if err := client.Save(twin); err != nil {
+		t.Fatal(err)
+	}
+	want = `error: This machine has several memberships in thread splice room "proj": "mac", "mac-twin". Ask your user which one to join under, then call join with machine=….`
+	if got := s.toolErr("join", map[string]any{"room": "proj"}); got != want {
+		t.Errorf("join with two memberships in the room:\n got %s\nwant %s", got, want)
+	}
+	if got := s.tool("join", map[string]any{"room": "proj", "machine": "mac"}); !strings.HasPrefix(got, `This session is already in room "proj" as "mac.repo".`) {
+		t.Errorf("join room=proj machine=mac: %s", got)
+	}
+	// One agent's fixed identity (join -as) beside the machine's leaves one to join under.
+	if err := os.Remove(filepath.Join(os.Getenv("THREADSPLICE_HOME"), "identities", "mac-twin.json")); err != nil {
+		t.Fatal(err)
+	}
+	fixed := mac.ID
+	fixed.Alias, fixed.Name, fixed.Machine, fixed.Owner = "codex-mac", "codex-mac", false, false
+	if err := client.Save(fixed); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.tool("join", map[string]any{"room": "proj"}); !strings.HasPrefix(got, `This session is already in room "proj" as "mac.repo".`) {
+		t.Errorf("join room=proj beside a fixed identity: %s", got)
 	}
 
 	// Identities from before session members aren't marked as the machine's:

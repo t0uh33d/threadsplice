@@ -273,8 +273,16 @@ func (s *server) decide(clientName string) {
 	s.decided = true
 	if sid := os.Getenv("CLAUDE_CODE_SESSION_ID"); strings.Contains(strings.ToLower(clientName), "claude") && client.ValidSessionID(sid) {
 		s.sess = newSession(sid)
-		if err := client.SetCurrent(s.sess.pid, sid); err != nil {
-			s.opt.Log.Warn("couldn't record this session", "err", err)
+		// The SessionStart hook may have run first and recorded the conversation
+		// this process really shows: after `claude --continue` this server can be
+		// handed the startup id instead of the resumed one, and after an MCP
+		// restart the id the process started with, before a /clear. Keep a
+		// record this process wrote; replace one an earlier process with the same
+		// pid left behind.
+		if _, at, ok := client.CurrentAt(s.sess.pid); !ok || at.Before(s.sess.started()) {
+			if err := client.SetCurrent(s.sess.pid, sid); err != nil {
+				s.opt.Log.Warn("couldn't record this session", "err", err)
+			}
 		}
 		return
 	}

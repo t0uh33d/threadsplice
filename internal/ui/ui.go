@@ -72,9 +72,10 @@ type Options struct {
 const launchTTL = 2 * time.Minute
 
 type server struct {
-	token   []byte
-	hosts   map[string]bool
-	version string
+	token    []byte
+	hosts    map[string]bool
+	version  string
+	released bool // a release's build (hooks.Released): invites point to the installer script first
 
 	mu       sync.Mutex
 	flash    map[string]inviteView // alias+room -> first invite of a room just created, shown once
@@ -91,7 +92,8 @@ func New(opt Options) (http.Handler, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ui: listen address: %w", err)
 	}
-	s := &server{token: []byte(opt.Token), version: cmp.Or(opt.Version, "dev"), flash: map[string]inviteView{}, hosts: map[string]bool{}}
+	s := &server{token: []byte(opt.Token), version: cmp.Or(opt.Version, "dev"), released: hooks.Released(opt.Version),
+		flash: map[string]inviteView{}, hosts: map[string]bool{}}
 	if opt.Launch != "" {
 		s.launch, s.launchBy = []byte(opt.Launch), time.Now().Add(launchTTL)
 	}
@@ -669,6 +671,7 @@ func (s *server) createRoom(w http.ResponseWriter, r *http.Request) {
 					if err != nil {
 						inv.Err = "The room is ready, but its first invite failed: " + redact(err.Error(), admin, id.Token)
 					}
+					inv.Released = s.released
 					s.mu.Lock()
 					s.flash[flashKey(id)] = inv
 					s.mu.Unlock()

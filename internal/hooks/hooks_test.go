@@ -555,7 +555,9 @@ func TestSetup(t *testing.T) {
 			`"remoteExport": false`,
 		},
 		"vscode": {
-			"threadsplice setup claude -as alice",
+			// The Claude Code extension gets session mode, not Copilot's identity.
+			"threadsplice setup claude: each session you pick then joins a room as a member of its own.",
+			"threadsplice setup claude -as <name>,",
 			".vscode/mcp.json",
 			`"servers": {`,
 			`"threadsplice": {"type": "stdio", "command": "threadsplice", "args": ["mcp", "-as", "alice"]}`,
@@ -578,6 +580,9 @@ func TestSetup(t *testing.T) {
 			t.Errorf("%s setup has an unfilled placeholder", target)
 		}
 		checkJSONBlocks(t, target, text)
+	}
+	if text, _ := Setup("vscode", "alice"); strings.Contains(text, "setup claude -as alice") {
+		t.Error("vscode setup points the Claude Code extension at the Copilot identity")
 	}
 	if _, ok := Setup("cursor", "alice"); ok {
 		t.Error("Setup accepted an unknown target")
@@ -653,5 +658,21 @@ func checkHookCommand(t *testing.T, target, ev, cmd string) {
 	}
 	if _, ok := events[strings.ToLower(ev)]; !ok {
 		t.Errorf("%s: hook command %q runs an event Hook rejects (%s)", target, cmd, ev)
+	}
+}
+
+// Only a build of a release tag knows the installer script is published:
+// Go stamps every other build with a pseudo-version or "(devel)", and
+// releases/latest skips pre-releases.
+func TestReleased(t *testing.T) {
+	for v, want := range map[string]bool{
+		"v0.1.0": true, "v1.12.3": true,
+		"": false, "dev": false, "(devel)": false, "v0.1.0-rc.1": false, "v0.1.0+dirty": false,
+		"v0.0.0-20261019003648-fec173409619": false, "v0.1.1-0.20261019003648-fec173409619+dirty": false,
+		"0.1.0": false, "v0.1": false,
+	} {
+		if Released(v) != want {
+			t.Errorf("Released(%q) = %v", v, !want)
+		}
 	}
 }

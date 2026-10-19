@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -163,14 +164,21 @@ func TestChildIdentities(t *testing.T) {
 		}
 	}
 
-	docs := done
-	docs.Name, docs.ParticipantID, docs.Token = "mac.docs", "PD", "td"
-	if err := SaveChild(docs); err != nil {
-		t.Fatal(err)
+	// By name, not by file name: "mac.docs-2.json" sorts before "mac.docs.json".
+	for _, n := range []string{"mac.docs-2", "mac.docs"} {
+		docs := done
+		docs.Name, docs.ParticipantID, docs.Token = n, "P"+n, "t"+n
+		if err := SaveChild(docs); err != nil {
+			t.Fatal(err)
+		}
 	}
 	ids, err := ListChildren("mac")
-	if err != nil || len(ids) != 2 || ids[0].Alias != "mac/mac.docs" || ids[1].Alias != "mac/mac.reviewer" {
-		t.Fatalf("ListChildren = %+v, %v", ids, err)
+	var names []string
+	for _, id := range ids {
+		names = append(names, id.Alias)
+	}
+	if want := []string{"mac/mac.docs", "mac/mac.docs-2", "mac/mac.reviewer"}; err != nil || !slices.Equal(names, want) {
+		t.Fatalf("ListChildren = %q, %v; want %q", names, err, want)
 	}
 	if ids, err := ListChildren("pc"); err != nil || len(ids) != 0 {
 		t.Fatalf("ListChildren(pc) = %+v, %v", ids, err)
@@ -412,6 +420,13 @@ func TestInUse(t *testing.T) {
 	b, _, _ := LoadBinding("s3")
 	if InUse("mac", "mac.docs", "s2") || b.Live() {
 		t.Fatalf("pid %d exited, yet its member is in use", dead)
+	}
+	// It ended without a SessionEnd hook: its record goes, and no check reads it again.
+	if _, ok := Current(dead); ok {
+		t.Fatalf("pid %d exited, yet its record stayed", dead)
+	}
+	if _, ok := Current(live); !ok {
+		t.Fatal("a live process's record went too")
 	}
 	if err := SetCurrent(live, "s3"); err != nil { // the conversation resumed in another process
 		t.Fatal(err)

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"cmp"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/t0uh33d/threadsplice/internal/api"
@@ -158,7 +160,7 @@ func ListChildren(parentAlias string) ([]Identity, error) {
 	if err != nil {
 		return nil, err
 	}
-	entries, err := os.ReadDir(dir) // sorted by file name
+	entries, err := os.ReadDir(dir)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	} else if err != nil {
@@ -178,6 +180,8 @@ func ListChildren(parentAlias string) ([]Identity, error) {
 		}
 		out = append(out, id)
 	}
+	// Not the file names' order: "x-2.json" sorts before "x.json".
+	slices.SortFunc(out, func(a, b Identity) int { return cmp.Compare(a.Name, b.Name) })
 	return out, nil
 }
 

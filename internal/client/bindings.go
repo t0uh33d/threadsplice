@@ -175,15 +175,21 @@ func SetCurrent(pid int, sid string) error {
 
 // Current returns the conversation the process pid shows now, if recorded.
 func Current(pid int) (string, bool) {
+	sid, _, ok := CurrentAt(pid)
+	return sid, ok
+}
+
+// CurrentAt is Current plus the time the record was written.
+func CurrentAt(pid int) (string, time.Time, bool) {
 	p, err := currentPath(pid)
 	if err != nil {
-		return "", false
+		return "", time.Time{}, false
 	}
 	var c current
 	if b, err := os.ReadFile(p); err != nil || json.Unmarshal(b, &c) != nil || !ValidSessionID(c.SessionID) {
-		return "", false
+		return "", time.Time{}, false
 	}
-	return c.SessionID, true
+	return c.SessionID, c.UpdatedAt, true
 }
 
 // ClearCurrent forgets the conversation of the process pid, as it ends.
@@ -207,7 +213,9 @@ func InUse(machine, child, exceptSID string) bool {
 
 // Live reports whether a live process shows b's session now: the process that
 // bound it, or one that resumed the conversation since, whose pid b doesn't
-// record.
+// record. The records of processes that are gone go on the way: one that ended
+// without a SessionEnd hook (hooks are optional; a crash or a kill skips them)
+// leaves its record behind, and every check would read it again.
 // ponytail: a crashed process's pid that the system reuses keeps its session
 // looking live until the new process ends; joining then takes another name.
 // Record process start times if that bites.
@@ -226,11 +234,14 @@ func (b Binding) Live() bool {
 			continue
 		}
 		pid, err := strconv.Atoi(strings.TrimSuffix(n, ".json"))
-		if err != nil || pid == b.PID {
-			continue
-		}
-		if sid, ok := Current(pid); ok && sid == b.SessionID && alive(pid) {
-			return true
+		switch {
+		case err != nil || pid <= 0:
+		case !alive(pid):
+			os.Remove(filepath.Join(dir, e.Name()))
+		case pid != b.PID:
+			if sid, ok := Current(pid); ok && sid == b.SessionID {
+				return true
+			}
 		}
 	}
 	return false

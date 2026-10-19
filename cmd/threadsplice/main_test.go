@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -214,16 +215,26 @@ func TestRoomCreateAndJoin(t *testing.T) {
 			invite = strings.TrimSpace(l)
 		}
 	}
-	for _, want := range []string{`Created room "proj"; you are "` + machine + `".`, "On the other machine:",
-		"  curl -fsSL https://github.com/t0uh33d/threadsplice/releases/latest/download/install.sh | sh\n",
-		"  threadsplice join          # paste the invite when asked\n",
-		"(or: go install github.com/t0uh33d/threadsplice/cmd/threadsplice@latest)", nextStep} {
+	// A test binary isn't a release's build, so go install comes first: the
+	// installer script exists only once a release does.
+	for _, want := range []string{`Created room "proj"; you are "` + machine + `".`,
+		"On the other machine, install thread splice, then join (it asks for the invite):\n" +
+			"  go install github.com/t0uh33d/threadsplice/cmd/threadsplice@latest\n  threadsplice join\n" +
+			"Without Go (from the first release on), install it with:\n" +
+			"  curl -fsSL https://github.com/t0uh33d/threadsplice/releases/latest/download/install.sh | sh\n", nextStep} {
 		if !strings.Contains(out, want) {
 			t.Errorf("room create's output lacks %q:\n%s", want, out)
 		}
 	}
 	if invite == "" || strings.Contains(out, "threadsplice join -as") {
 		t.Fatalf("room create's output:\n%s", out)
+	}
+	// Pasted into zsh, whose default has no interactive comments, a "# …"
+	// after a command would become its arguments.
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "#") && !strings.HasPrefix(l, "  "+ts.URL+"#") {
+			t.Errorf("a printed line has a comment: %q", l)
+		}
 	}
 	if id, err := client.Load(machine); err != nil || !id.Machine || !id.Owner || id.Name != machine {
 		t.Errorf("the owner's membership = %+v, %v", id, err)
@@ -253,6 +264,30 @@ func TestRoomCreateAndJoin(t *testing.T) {
 	var ue usageError
 	if err := run(ctx, []string{"join", invite, "-as", "carol"}); err == nil || errors.As(err, &ue) || !strings.Contains(err.Error(), "HTTP 403") {
 		t.Errorf("joining with a used invite: %v", err)
+	}
+	// join -as makes a fixed identity for one agent, not a second machine
+	// membership: Claude Code sessions keep a single one to join under.
+	joinHome := os.Getenv("THREADSPLICE_HOME")
+	t.Setenv("THREADSPLICE_HOME", ownerHome)
+	out = capture(t, func() error { return run(ctx, []string{"invite", "-as", machine}) })
+	t.Setenv("THREADSPLICE_HOME", joinHome)
+	var second string
+	for _, l := range strings.Split(out, "\n") {
+		if strings.HasPrefix(l, "  "+ts.URL+"#") {
+			second = strings.TrimSpace(l)
+		}
+	}
+	out = capture(t, func() error {
+		return withStdin(t, second+"\n", func() error { return run(ctx, []string{"join", "-as", "codex-" + machine}) })
+	})
+	if want := `Joined room "proj" as "codex-` + machine + `".` + "\n" + fmt.Sprintf(fixedStep, "codex-"+machine); out != want {
+		t.Errorf("join -as's output:\n got %q\nwant %q", out, want)
+	}
+	if id, err := client.Load("codex-" + machine); err != nil || id.Machine || id.Name != "codex-"+machine {
+		t.Errorf("the fixed identity = %+v, %v", id, err)
+	}
+	if ms, err := client.MachineMemberships("proj", ""); err != nil || len(ms) != 1 || ms[0].Alias != machine+"-2" {
+		t.Errorf("memberships sessions join under: %+v, %v", ms, err)
 	}
 
 	// identities shows session members under their machine, sessions the
@@ -302,6 +337,17 @@ func TestRoomCreateAndJoin(t *testing.T) {
 	out = capture(t, func() error { return run(ctx, []string{"revoke", "-as", machine, machine + ".repo"}) })
 	if !strings.Contains(out, `Revoked "`+machine+`.repo".`) {
 		t.Errorf("revoke a session member: %s", out)
+	}
+}
+
+// A release's build points the other machine to the installer script first;
+// any other build to go install, as the script exists only once a release does.
+func TestInstallSteps(t *testing.T) {
+	for released, first := range map[bool]string{true: installScript, false: goInstall} {
+		got := installSteps(released)
+		if !strings.HasPrefix(got, "  "+first+"\n  threadsplice join\n") || strings.Count(got, "\n  ") != 2 || strings.Contains(got, "#") {
+			t.Errorf("released %v:\n%s", released, got)
+		}
 	}
 }
 

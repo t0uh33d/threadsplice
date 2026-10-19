@@ -43,8 +43,8 @@
   </div>
   <div class="room-actions">
     <button type="button" class="btn members-btn" data-drawer aria-controls="members" aria-expanded="false">{{template "i-users"}}<span>Members</span></button>
-    <a class="btn" href="/r/{{.Alias}}/invites">Invite a machine</a>
-    <a class="btn primary" href="/r/{{.Alias}}/connect">Connect an agent</a>
+    <a class="btn" href="/r/{{.Alias}}/invites"><span>Invite<span class="long"> a machine</span></span></a>
+    <a class="btn primary" href="/r/{{.Alias}}/connect"><span>Connect<span class="long"> an agent</span></span></a>
   </div>
 </header>{{end}}
 
@@ -78,7 +78,7 @@
 </div>
 </li>{{end}}
 
-{{define "poller"}}<div id="poller" hx-get="/r/{{.Room.Alias}}/feed?after={{.Last}}" hx-trigger="every 2s, ts-sent from:body" hx-swap="outerHTML"></div>{{end}}
+{{define "poller"}}<div id="poller"{{if not .Gone}} hx-get="/r/{{.Room.Alias}}/feed?after={{.Last}}" hx-trigger="every 2s, ts-sent from:body" hx-swap="outerHTML"{{end}}></div>{{end}}
 
 {{define "feed"}}
 {{- if or .Rows .Skipped}}<ol hx-swap-oob="beforeend:#feed">{{if .Skipped}}<li class="note">{{.Skipped}} messages skipped to catch up.</li>{{end}}{{range .Rows}}{{template "row" .}}{{end}}</ol>{{end}}
@@ -86,7 +86,7 @@
 {{template "poller" .}}
 {{- end}}
 
-{{define "participants"}}<section id="participants" class="panel" hx-get="/r/{{.Room.Alias}}/participants" hx-trigger="every 5s" hx-swap="outerHTML" data-count="{{.Count}}" data-others="{{.Others}}" data-sessions="{{.Sessions}}">
+{{define "participants"}}<section id="participants" class="panel"{{if not .Gone}} hx-get="/r/{{.Room.Alias}}/participants" hx-trigger="every 5s" hx-swap="outerHTML"{{end}} data-count="{{.Count}}" data-others="{{.Others}}" data-sessions="{{.Sessions}}">
 <div class="panel-head">
   <h2 id="members-h" tabindex="-1">Members <span class="count">{{.Count}}</span></h2>
   <button type="button" id="members-close" class="btn icon close-drawer" data-close-drawer aria-label="Close members">{{template "i-x"}}</button>
@@ -142,6 +142,9 @@
 </div>
 </form>{{end}}
 
+{{define "install-script"}}curl -fsSL https://github.com/t0uh33d/threadsplice/releases/latest/download/install.sh | sh{{end}}
+{{define "go-install"}}go install github.com/t0uh33d/threadsplice/cmd/threadsplice@latest{{end}}
+
 {{define "invite"}}{{if .Err}}<p class="error" role="alert">{{.Err}}</p>{{else}}<div class="invite">
 <label for="invite-value">Invite</label>
 <div class="secret">
@@ -151,8 +154,10 @@
 </div>
 <p id="invite-note" class="help">Anyone with this invite can join once. Expires {{.Expires}}. It holds the room key, so share it privately.</p>
 <p class="label">On the other machine, run:</p>
-<div class="code-block"><div class="code-head"><span>Terminal</span>{{template "copy"}}</div><pre>curl -fsSL https://github.com/t0uh33d/threadsplice/releases/latest/download/install.sh | sh
+{{- /* The installer script is a release asset: until this UI is a release's build, go install comes first. */}}
+<div class="code-block"><div class="code-head"><span>Terminal</span>{{template "copy"}}</div><pre>{{if .Released}}{{template "install-script"}}{{else}}{{template "go-install"}}{{end}}
 threadsplice join          <span class="cmt"># then paste the invite when asked</span></pre></div>
-<p class="help">(or <code>go install github.com/t0uh33d/threadsplice/cmd/threadsplice@latest</code>)</p>
+{{if .Released}}<p class="help">(or <code>{{template "go-install"}}</code>)</p>
+{{- else}}<p class="help">Without Go, from the first release on: <code>{{template "install-script"}}</code></p>{{end}}
 <p class="help">Or open <code>threadsplice ui</code> there and choose <strong>Join room</strong>.</p>
 </div>{{end}}{{end}}

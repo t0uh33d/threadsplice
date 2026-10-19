@@ -3,8 +3,9 @@ package client
 // MachineMemberships returns the identities a session member can join under:
 // the top-level identities in the room named room, with the local name alias
 // (either empty: any), narrowed to those marked Machine when any of them is.
-// Files from before session members aren't marked, so they count only when no
-// candidate is. Identities that can't be read are left out.
+// Files from before session members aren't marked, and neither are the fixed
+// identities join -as makes for one agent (Codex, Copilot, a bridge), so they
+// count only when no candidate is. Identities that can't be read are left out.
 func MachineMemberships(room, alias string) ([]Identity, error) {
 	names, err := List()
 	if err != nil {
