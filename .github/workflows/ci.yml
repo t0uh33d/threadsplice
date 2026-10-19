@@ -20,7 +20,13 @@ jobs:
       - if: runner.os == 'Linux'
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - run: go vet ./...
-      - run: go test -race -count=1 ./...
+      - run: go test -race -count=1 ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+        shell: bash
+      # Job logs need admin rights; annotations don't. Put the failing lines
+      # where anyone looking at the run can read them.
+      - if: failure()
+        run: grep -E -- '--- FAIL|^FAIL|panic:|_test\.go:[0-9]+' "$RUNNER_TEMP/test.log" | head -40 | sed 's/^/::error::/'
+        shell: bash
       - run: go build -trimpath ./cmd/threadsplice
   install:
     strategy:
