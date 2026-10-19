@@ -11,11 +11,11 @@
         </section>{{end}}
         {{with .Steps}}{{template "checklist" .}}{{end}}
         <ol id="feed" class="feed" role="log" aria-label="Conversation">
-          <li class="note e2ee">{{template "i-lock"}} Messages are end-to-end encrypted: they're decrypted on this machine, and the relay only sees ciphertext.
+          <li class="note e2ee">{{template "i-lock"}} Messages are end-to-end encrypted: only this room's members can read them, not the relay that passes them on.
           {{if .Room.Owner}}As the room's owner, you see every message in this room, including direct messages between members.{{else}}You see messages to you, to everyone, and your own.{{end}}</li>
           <li class="empty">
             <h2>No messages yet.</h2>
-            <p>Connect Claude Code on this machine, then say “join the thread splice room” in a Claude chat.</p>
+            <p>Connect Claude Code on this machine, then say “{{.Phrase}}” in a Claude chat.</p>
             <a class="btn" href="/r/{{.Room.Alias}}/connect">Connect an agent</a>
           </li>
           {{- if .Feed.Skipped}}<li class="note">{{.Feed.Skipped}} earlier messages not shown.</li>{{end -}}
@@ -65,7 +65,7 @@
 <div class="mbody">
 <p class="head"><span class="who">{{if .Mine}}You{{else}}{{.From}}{{end}}</span>{{with .On}} <span class="on">on {{.}}</span>{{end}}{{if .Agent}} <span class="tag agent">agent</span>{{end}}{{if .To}} <span class="to">to {{if .ToMe}}you{{else}}{{.To}}{{end}}</span>{{end}} <time datetime="{{.At.UTC.Format "2006-01-02T15:04:05Z"}}" title="{{.At.Local.Format "Mon Jan 2 2006 15:04:05"}}{{with .ID}} · id {{.}}{{end}}">{{clock .At}}</time></p>
 <div class="bubble">
-{{- if .Err}}<p class="err">{{template "i-alert"}}<span>Couldn't decrypt this message: {{.Err}}</span></p>
+{{- if .Err}}<p class="err">{{template "i-alert"}}<span><strong>Couldn't decrypt this message.</strong> {{.Err}}</span></p>
 {{- else}}
 {{- if eq .Kind "ask"}}<p class="tags"><span class="tag ask">Ask</span></p>{{end}}
 {{- if .ReplyTo}}<a class="quote" href="#m-{{.ReplyTo}}"><span class="re"><span aria-hidden="true">↩</span> reply to</span> {{with .Quote}}<span class="q">“{{.}}”</span>{{else}}<span class="q" data-quote><code>{{short $.ReplyTo}}</code></span>{{end}}</a>{{end}}
@@ -101,7 +101,10 @@
 </li>
 {{- end}}
 </ul>
-{{with .Removed}}<details class="removed"><summary>Removed ({{len .}})</summary><ul class="tree">{{range .}}<li class="member">{{template "member" .}}</li>{{end}}</ul></details>{{end}}
+{{- if and (not .Err) (eq .Others 0)}}
+<p class="alone help">Only this machine so far. {{if .Room.Owner}}<a href="/r/{{.Room.Alias}}/invites">Invite a machine</a> or <a href="/r/{{.Room.Alias}}/connect">connect an agent</a>{{else}}<a href="/r/{{.Room.Alias}}/connect">Connect an agent</a>{{end}}.</p>
+{{- end}}
+{{with .Removed}}<details class="removed"><summary>Removed ({{len .}}){{template "i-chevron"}}</summary><ul class="tree">{{range .}}<li class="member">{{template "member" .}}</li>{{end}}</ul></details>{{end}}
 </section>{{end}}
 
 {{define "member"}}<div class="mrow">
@@ -133,8 +136,8 @@
 <textarea id="compose-text" name="text" rows="1" required maxlength="98304" placeholder="Write a message…" data-grow aria-describedby="compose-hint{{if .Err}} compose-err{{end}}"{{if or .Sent .Err}} autofocus{{end}}>{{.Text}}</textarea>
 {{if .Err}}<p id="compose-err" class="error" role="alert">{{.Err}}</p>{{end}}
 <div class="c-foot">
-  <p id="compose-hint" class="hint"><kbd data-os="mac">⌘↩</kbd><kbd data-os="other">Ctrl+↩</kbd> to send, as {{.Room.Name}} (this machine)</p>
-  {{if .Sent}}<span class="sent" role="status">{{template "i-check"}}Sent</span>{{end}}
+  <p id="compose-hint" class="hint">Sending as {{.Room.Name}} (this machine)<span class="keys"> · <kbd data-os="mac">⌘↩</kbd><kbd data-os="other">Ctrl+↩</kbd> to send</span></p>
+  {{if .Sent}}<span class="sent">{{template "i-check"}}Sent</span>{{end}}
   <button type="submit" class="btn primary send"><span>Send</span>{{template "i-send"}}</button>
 </div>
 </form>{{end}}
@@ -149,7 +152,7 @@
 <p id="invite-note" class="help">Anyone with this invite can join once. Expires {{.Expires}}. It holds the room key, so share it privately.</p>
 <p class="label">On the other machine, run:</p>
 <div class="code-block"><div class="code-head"><span>Terminal</span>{{template "copy"}}</div><pre>curl -fsSL https://github.com/t0uh33d/threadsplice/releases/latest/download/install.sh | sh
-threadsplice join          # then paste the invite when asked</pre></div>
+threadsplice join          <span class="cmt"># then paste the invite when asked</span></pre></div>
 <p class="help">(or <code>go install github.com/t0uh33d/threadsplice/cmd/threadsplice@latest</code>)</p>
 <p class="help">Or open <code>threadsplice ui</code> there and choose <strong>Join room</strong>.</p>
 </div>{{end}}{{end}}

@@ -30,7 +30,7 @@
 <div class="side-top">
   <a class="brand" href="/">{{template "mark" ""}}<span>thread splice</span></a>
   <details class="switcher">
-    <summary><span class="sw-label">{{with .CurrentRoom}}{{.}}{{else}}Rooms{{end}}</span>{{template "i-chevron"}}</summary>
+    <summary><span class="sw-label">{{with .CurrentRoom}}<span class="sr">Room: </span>{{.}}{{else}}Rooms{{end}}</span>{{template "i-chevron"}}</summary>
     <div class="sw-menu">
       {{template "rooms" .}}
       <div class="side-actions"><a class="btn" href="/#create">{{template "i-plus"}}<span>New room</span></a><a class="btn" href="/#join">Join room</a></div>

@@ -3,6 +3,7 @@ package ui
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/t0uh33d/threadsplice/internal/api"
 	"github.com/t0uh33d/threadsplice/internal/client"
+	"github.com/t0uh33d/threadsplice/internal/e2ee"
 )
 
 // roomView is all a page may show about an identity: never its token or room key.
@@ -34,6 +36,7 @@ type roomPage struct {
 	Compose composeView
 	Flash   *inviteView
 	Steps   *checklist // nil once every step is done
+	Phrase  string     // what to say in a Claude chat to join, for the empty state
 }
 
 // checklist is the room's getting-started steps, from real state; ui.js
@@ -96,6 +99,7 @@ func (s *server) room(w http.ResponseWriter, r *http.Request) {
 	p.Feed = history(ctx, rd, v, 0)
 	annotate(p.Feed.Rows, p.Members.byID)
 	p.Compose = composeView{Room: v, Peers: p.Members.recipients()}
+	p.Phrase, _ = joinPhrase(v)
 	if p.Members.Err == "" && p.Feed.Err == "" {
 		c := checklist{Room: v, Members: p.Members.Others > 0, Sessions: p.Members.Sessions > 0, Messages: len(p.Feed.Rows) > 0 || p.Feed.Skipped > 0}
 		if !c.Members || !c.Sessions || !c.Messages {
@@ -186,11 +190,26 @@ func rowOf(m client.Message, me string) row {
 	}
 	r.Initials, r.Av = avatar(r.From, "")
 	if m.Err != nil {
-		r.Err = m.Err.Error()
+		r.Err = undecryptable(m.Err)
 		return r
 	}
 	r.Kind, r.Text, r.ReplyTo, r.Depth = cmp.Or(m.Kind, api.KindMessage), m.Text, m.ReplyTo, m.Depth
 	return r
+}
+
+// undecryptable says in plain words why a message can't be shown. Opening
+// fails in e2ee (wrong key, changed on the way, an unknown format) or in
+// decoding what decrypted.
+func undecryptable(err error) string {
+	var syntax *json.SyntaxError
+	var typ *json.UnmarshalTypeError
+	switch {
+	case errors.Is(err, e2ee.ErrOpen):
+		return "It wasn't sealed with this room's key, or it was changed on the way."
+	case errors.As(err, &syntax), errors.As(err, &typ):
+		return "It decrypted, but it isn't a message thread splice can show."
+	}
+	return "It isn't in a format this version of thread splice can read."
 }
 
 // link groups consecutive rows per sender and ties replies to what they
@@ -353,26 +372,32 @@ func peers(ctx context.Context, a *client.Agent, v roomView) peersView {
 		return 1
 	})
 	at := map[string]int{}
+	var kids []peer
 	for _, q := range all {
-		if q.Revoked {
+		switch {
+		case q.Revoked:
 			p.Removed = append(p.Removed, q)
 			continue
+		case q.Parent != "":
+			p.Sessions++
+			kids = append(kids, q)
+		default:
+			at[q.ID] = len(p.Machines)
+			p.Machines = append(p.Machines, q)
 		}
 		p.Count++
 		if !q.You {
 			p.Others++
 		}
-		if q.Parent != "" {
-			p.Sessions++
-			if i, ok := at[q.Parent]; ok {
-				p.Machines[i].Sessions = append(p.Machines[i].Sessions, q)
-				continue
-			}
+	}
+	// Sessions go under their machine wherever the relay listed them; one
+	// whose machine was removed (the relay should have removed it too) stands alone.
+	for _, k := range kids {
+		if i, ok := at[k.Parent]; ok {
+			p.Machines[i].Sessions = append(p.Machines[i].Sessions, k)
+		} else {
+			p.Machines = append(p.Machines, k)
 		}
-		if q.Parent == "" {
-			at[q.ID] = len(p.Machines)
-		}
-		p.Machines = append(p.Machines, q) // a session whose machine isn't listed (yet) stands alone
 	}
 	return p
 }
@@ -466,6 +491,7 @@ type connectPage struct {
 	NameRoom      bool // this machine is in several rooms, so the phrase names this one
 	Exe, Home     string
 	Targets       []string // agents that join with a fixed member instead
+	Fixed         string   // a name to suggest for such a member
 }
 
 // connect shows how a Claude Code session on this machine joins the room:
@@ -479,17 +505,26 @@ func (s *server) connect(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	v := viewOf(a.ID)
 	p := connectPage{frame: s.frame("Connect an agent · "+v.Room, v.Alias), Room: v, Hooks: claudeHooks,
-		Sessions: sessionsOf(peers(ctx, reader(a), v)), Targets: []string{"codex", "copilot", "vscode"}}
-	// The user pastes the phrase into a Claude chat as their own words, and
-	// the room name came from the relay: it goes in only if it's a valid name.
-	p.NameRoom = machines() > 1 && api.ValidName(v.Room)
-	p.Phrase = "join the thread splice room as reviewer"
-	if p.NameRoom {
-		p.Phrase = "join the thread splice room " + v.Room + " as reviewer"
+		Sessions: sessionsOf(peers(ctx, reader(a), v)), Targets: []string{"codex", "copilot", "vscode"}, Fixed: "codex-" + v.Name}
+	p.Phrase, p.NameRoom = joinPhrase(v)
+	p.Phrase += " as reviewer"
+	if !api.ValidName(p.Fixed) { // a long machine name leaves no room for the prefix
+		p.Fixed = "codex"
 	}
 	p.Exe, _ = os.Executable()
 	p.Home = os.Getenv("THREADSPLICE_HOME")
 	s.render(w, http.StatusOK, "connect", "layout", p)
+}
+
+// joinPhrase is what to say in a Claude chat to join v's room. Once this
+// machine is in several rooms it names the room, as the join tool then needs
+// it. The user pastes it as their own words and the room name came from the
+// relay, so the name goes in only if it's a valid one.
+func joinPhrase(v roomView) (phrase string, named bool) {
+	if machines() > 1 && api.ValidName(v.Room) {
+		return "join the thread splice room " + v.Room, true
+	}
+	return "join the thread splice room", false
 }
 
 // machines counts the memberships a session's join could pick from, as the

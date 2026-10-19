@@ -19,11 +19,11 @@
   {{- if .Home}}
   <p class="help">THREADSPLICE_HOME is set (<code>{{.Home}}</code>): the agent must run with the same value, or its hooks and MCP server won't find this member.</p>
   {{- end}}
-  {{- else if .Aliases}}
+  {{- else if .Members}}
   <form class="card row-form" method="get" action="/setup/{{.Target}}">
     <div class="field">
       <label for="s-as">Member</label>
-      <select id="s-as" name="as">{{range .Aliases}}<option>{{.}}</option>{{end}}</select>
+      <select id="s-as" name="as">{{range .Members}}<option value="{{.Alias}}">{{.Label}}</option>{{end}}</select>
     </div>
     <button type="submit" class="btn primary">Show setup</button>
   </form>

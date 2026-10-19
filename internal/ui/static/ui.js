@@ -63,10 +63,19 @@
     getSelection().removeAllRanges();
     getSelection().addRange(r);
   };
+  // A block's # comments (.cmt) are shown, never copied: zsh's default
+  // (no interactive comments) would pass them on as arguments.
+  const textOf = (el) => {
+    if (el.matches('input, textarea')) return el.value;
+    if (!el.querySelector('.cmt')) return el.textContent;
+    const c = el.cloneNode(true);
+    c.querySelectorAll('.cmt').forEach((n) => n.remove());
+    return c.textContent.replace(/[ \t]+$/gm, '');
+  };
   const copy = (b) => {
     const el = copySource(b);
     if (!el) return;
-    const text = el.matches('input, textarea') ? el.value : el.textContent;
+    const text = textOf(el);
     const manual = () => {
       selectText(el);
       feedback(b, 'Press ' + copyKeys, false);
@@ -224,7 +233,10 @@
       const b = box();
       b.scrollTo({ top: b.scrollHeight, behavior: smooth && !reduced.matches ? 'smooth' : 'auto' });
     };
-    let follow = true;
+    // A conversation opens at its newest message. A room without one yet
+    // opens at the top, where its first invite (shown only this once) and the
+    // getting-started steps are.
+    let follow = !!feed.querySelector('.msg');
     const onScroll = () => {
       follow = atBottom();
       if (follow && pill) pill.hidden = true;
@@ -234,7 +246,8 @@
     // Follow only while the reader is at the bottom; the composer growing or
     // the window resizing mustn't leave them stranded above it.
     new ResizeObserver(() => { if (follow) toBottom(false); }).observe(scroll);
-    toBottom(false);
+    if (follow) toBottom(false);
+    else follow = atBottom();
     new MutationObserver((records) => {
       let fresh = false;
       for (const r of records) {
@@ -246,7 +259,10 @@
         }
       }
       const rows = feed.getElementsByClassName('msg');
-      while (rows.length > MAX_ROWS) rows[0].remove();
+      if (rows.length > MAX_ROWS) {
+        while (rows.length > MAX_ROWS) rows[0].remove();
+        rows[0].classList.remove('cont'); // its group's header went with the rows above
+      }
       if (!fresh) return;
       steps();
       if (follow) toBottom(false);
@@ -292,6 +308,9 @@
       sessions = now;
     } else if (el.matches('.invite') && el.parentElement?.id === 'invite-result') {
       announce('Invite created. It is masked; Copy copies it as it is.');
+    } else if (el.id === 'compose' && el.querySelector('.sent')) {
+      // A live region swapped in with its text already there often goes unread.
+      announce('Sent.');
     }
   });
 

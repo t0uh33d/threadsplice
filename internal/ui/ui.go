@@ -656,6 +656,9 @@ func (s *server) createRoom(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := relayCtx(r)
 		defer cancel()
 		m, err := client.New(f.Relay, admin).CreateRoom(ctx, f.Room, f.Name)
+		if err == nil && !api.ValidName(m.RoomName) { // see joinRoom
+			err = errors.New("the relay created the room but gave it an invalid name, so it wasn't saved on this machine")
+		}
 		if err == nil {
 			key := e2ee.NewKey() // generated here; the relay never sees it
 			id := client.Identity{Relay: f.Relay, RoomID: m.RoomID, RoomName: m.RoomName, ParticipantID: m.ParticipantID,
@@ -737,6 +740,11 @@ func (s *server) joinRoom(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
+		// The room name reaches models later (message frames, tool results):
+		// the relay must not slip text in, here no more than through the CLI.
+		if err == nil && !api.ValidName(m.RoomName) {
+			err = errors.New("the relay gave the room an invalid name, so this machine didn't join. Ask the room's owner about the relay")
+		}
 		if err == nil {
 			id := client.Identity{Relay: relayURL, RoomID: m.RoomID, RoomName: m.RoomName, ParticipantID: m.ParticipantID,
 				Name: name, Machine: true, Token: m.Token, RoomKey: key.String()}
@@ -791,8 +799,13 @@ type setupPage struct {
 	frame
 	Target, Alias, Exe, Home string
 	Blocks                   []block
-	Targets, Aliases         []string
+	Targets                  []string
+	Members                  []setupMember
 }
+
+// setupMember is a membership in the picker. Its local name alone doesn't
+// say which room it is in, so the label adds the room.
+type setupMember struct{ Alias, Label string }
 
 // setup shows what `threadsplice setup <target> -as <alias>` prints, with a
 // Copy button on each command and config block.
@@ -803,9 +816,16 @@ func (s *server) setup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := setupPage{frame: s.frame("Set up "+agentName(target), ""), Target: target, Targets: hooks.SetupTargets}
-	p.Aliases, _ = client.List()
+	aliases, _ := client.List()
+	for _, a := range aliases {
+		m := setupMember{a, a}
+		if id, err := client.Load(a); err == nil {
+			m.Label = id.Name + " · " + id.RoomName
+		}
+		p.Members = append(p.Members, m)
+	}
 	if as := r.URL.Query().Get("as"); as != "" {
-		if !client.ValidAlias(as) || !slices.Contains(p.Aliases, as) {
+		if !client.ValidAlias(as) || !slices.Contains(aliases, as) {
 			s.fail(w, r, http.StatusNotFound, "This machine has no member by that name.")
 			return
 		}

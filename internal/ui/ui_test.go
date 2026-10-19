@@ -341,7 +341,7 @@ func TestRoomFlow(t *testing.T) {
 		t.Fatalf("create: Location %q", loc)
 	}
 	r := e.get("/r/alice")
-	must(t, r, http.StatusOK, `<h1 id="room-title">proj</h1>`, "you: <strong>alice</strong> (this machine)", "the relay only sees ciphertext",
+	must(t, r, http.StatusOK, `<h1 id="room-title">proj</h1>`, "you: <strong>alice</strong> (this machine)", "not the relay that passes them on",
 		"As the room's owner, you see every message in this room, including direct messages between members.",
 		"Here's its first invite", "Anyone with this invite can join once", `id="checklist"`, `class="step done"`,
 		`href="/r/alice/connect"`, `href="/r/alice/invites"`, "No messages yet.")
@@ -380,6 +380,8 @@ func TestRoomFlow(t *testing.T) {
 	must(t, e.get("/"), http.StatusOK, "proj <span class=\"as\">· as alice</span>", "proj <span class=\"as\">· as carol</span>")
 
 	must(t, e.get("/setup/claude?as=carol"), http.StatusOK, "claude mcp add --scope user threadsplice -- threadsplice mcp -as carol", `aria-current="page">Claude Code<`)
+	// The picker names each member's room: the local names alone don't say it.
+	must(t, e.get("/setup/codex"), http.StatusOK, `<option value="alice">alice · proj</option>`, `<option value="carol">carol · proj</option>`)
 	for _, p := range []string{"/setup/emacs?as=carol", "/setup/claude?as=nobody", "/r/nobody", "/r/nobody/feed?after=0",
 		"/r/nobody/connect", "/r/nobody/invites", "/r/nobody/sessions", "/r/nobody/participants"} {
 		if r := e.get(p); r.code != http.StatusNotFound {
@@ -395,7 +397,7 @@ func TestRoomFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	r = e.hx(http.MethodPost, "/r/alice/send", url.Values{"to": {carol.ID.ParticipantID}, "kind": {"ask"}, "text": {"for carol only\r\nline two"}})
-	must(t, r, http.StatusOK, `id="compose"`, `class="sent" role="status"`, "autofocus>", `<option value="`+carol.ID.ParticipantID+`" selected>`)
+	must(t, r, http.StatusOK, `id="compose"`, `<span class="sent">`, "autofocus>", `<option value="`+carol.ID.ParticipantID+`" selected>`)
 	mustNot(t, r, " checked") // an ask is one message: the toggle starts over
 	if r.h.Get("HX-Trigger") != "ts-sent" {
 		t.Errorf("HX-Trigger = %q", r.h.Get("HX-Trigger"))
@@ -417,7 +419,8 @@ func TestRoomFlow(t *testing.T) {
 	// The owner sees the whole room, DMs between others included; peer text stays text.
 	r = e.hx(http.MethodGet, "/r/alice/feed?after=0", nil)
 	must(t, r, http.StatusOK, `hx-swap-oob="beforeend:#feed"`, escaped, "for carol only\nline two", "hello room", "plain one",
-		`href="#m-`+got[1].ID+`"`, "Couldn't decrypt this message", `class="tag ask">Ask<`, "reply to</span>",
+		`href="#m-`+got[1].ID+`"`, "<strong>Couldn't decrypt this message.</strong> It wasn&#39;t sealed with this room&#39;s key, or it was changed on the way.",
+		`class="tag ask">Ask<`, "reply to</span>",
 		"“for carol only line two”", `id="m-`+got[1].ID+`" class="msg k-ask mine answered"`, "Waiting for carol…",
 		`<span class="to">to carol</span>`)
 	mustNot(t, r, "<script>alert", "<img src=x", `hx-get="/r/alice/invites"`, `hx-trigger="load"`)
@@ -440,8 +443,9 @@ func TestRoomFlow(t *testing.T) {
 	// Invites: a real one for the owner, none for anyone else. The invite
 	// never goes into a command line.
 	r = e.hx(http.MethodPost, "/r/alice/invite", url.Values{"ttl": {"1h"}})
+	// The comment is shown but not copied: zsh, by default, would pass it to join as arguments.
 	must(t, r, http.StatusOK, "Anyone with this invite can join once", `type="password" readonly`, "data-reveal=\"invite-value\"",
-		"curl -fsSL https://github.com/t0uh33d/threadsplice/releases/latest/download/install.sh | sh\nthreadsplice join          # then paste the invite when asked",
+		"curl -fsSL https://github.com/t0uh33d/threadsplice/releases/latest/download/install.sh | sh\nthreadsplice join          <span class=\"cmt\"># then paste the invite when asked</span></pre>",
 		"go install github.com/t0uh33d/threadsplice/cmd/threadsplice@latest", "autofocus>")
 	mustNot(t, r, "threadsplice join -as", "threadsplice join '")
 	relayURL, tok, key, err := client.ParseInvite(inviteIn(t, r.body))
@@ -580,7 +584,10 @@ func TestWatching(t *testing.T) {
 	must(t, e.get("/r/carol"), http.StatusOK, "you: <strong>carol</strong> (this machine)")
 	must(t, e.hx(http.MethodGet, "/r/carol/participants", nil), http.StatusOK, `<span class="mname">carol</span>`, `<span class="tag">this machine</span>`)
 	must(t, e.hx(http.MethodGet, "/r/carol/feed?after=0", nil), http.StatusOK)
-	must(t, e.get("/r/carol/connect"), http.StatusOK)
+	// Only the owner can invite: anyone else is pointed to the owner, not to a page that refuses.
+	c := e.get("/r/carol/connect")
+	must(t, c, http.StatusOK, "get an invite from the room's owner, run <code>threadsplice join -as codex-carol</code>")
+	mustNot(t, c, `href="/r/carol/invites">create an invite`)
 	ps, err := alice.Peers(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -756,7 +763,7 @@ func TestSessionMembers(t *testing.T) {
 		// the panel: machines with their sessions under them
 		`data-count="5" data-others="4" data-sessions="3"`, `<span class="mname">mac.reviewer</span>`, `<span class="state">busy</span>`,
 		`<span class="state">away</span>`, "Remove machine “linux” and its 1 session member?", "Remove “mac.web” from the room?")
-	mustNot(t, r, `id="checklist"`) // every step is done
+	mustNot(t, r, `id="checklist"`, "Only this machine so far") // every step is done
 	if i, j := strings.Index(r.body, `data-name="mac.web"`), strings.Index(r.body, `data-name="linux"`); i < 0 || j < 0 || i > j {
 		t.Error("mac's sessions aren't listed under mac")
 	}
@@ -766,8 +773,11 @@ func TestSessionMembers(t *testing.T) {
 	c := e.get("/r/mac/connect")
 	must(t, c, http.StatusOK, "claude mcp add --scope user threadsplice -- threadsplice mcp</pre>", `&#34;command&#34;: &#34;threadsplice hook claude&#34;`,
 		"join the thread splice room as reviewer</pre>", "<strong>mac.reviewer</strong>", "leave the thread splice room",
-		`hx-get="/r/mac/sessions" hx-trigger="every 3s"`, `data-names="mac.reviewer mac.web "`, `href="/setup/codex"`, "threadsplice join -as codex-mac", "WSL")
-	mustNot(t, c, "linux.api", "-as mac", "data-dialog")
+		`hx-get="/r/mac/sessions" hx-trigger="every 3s"`, `data-names="mac.reviewer mac.web "`, `href="/setup/codex"`, "threadsplice join -as codex-mac", "WSL",
+		// an earlier -as setup would make `claude mcp add` fail, and its hooks would run twice
+		"claude mcp remove threadsplice --scope user", "thread splice hooks with <code>-as</code>? Replace them",
+		`<a href="/r/mac/invites">create an invite</a>`)
+	mustNot(t, c, "linux.api", "-as mac", "data-dialog", "get an invite from")
 	s := e.hx(http.MethodGet, "/r/mac/sessions", nil)
 	must(t, s, http.StatusOK, "mac.reviewer", "mac.web")
 	mustNot(t, s, "linux")
@@ -782,7 +792,8 @@ func TestSessionMembers(t *testing.T) {
 	g.member(api.Participant{ID: "MAC", Name: "mac", Owner: true, Online: true}, "mac", "MACTOKEN0123456789")
 	r = e2.get("/r/mac")
 	must(t, r, http.StatusOK, `id="checklist"`, `id="step-members" class="step"`, `id="step-session" class="step"`, `id="step-message" class="step"`,
-		"No messages yet.", "say “join the thread splice room” in a Claude chat")
+		"No messages yet.", "say “join the thread splice room” in a Claude chat",
+		`Only this machine so far. <a href="/r/mac/invites">Invite a machine</a> or <a href="/r/mac/connect">connect an agent</a>.`)
 	must(t, e2.hx(http.MethodGet, "/r/mac/sessions", nil), http.StatusOK, "None yet. They appear here as soon as a session joins.")
 }
 
@@ -805,6 +816,43 @@ func TestSessionMembersGetNoPages(t *testing.T) {
 		}
 	}
 	mustNot(t, e.get("/"), "alice.rev")
+}
+
+// Sessions group under their machine whatever order the relay lists members
+// in; one whose machine is gone but which is still active stands alone.
+func TestSessionsBeforeTheirMachine(t *testing.T) {
+	e := newEnv(t)
+	f := newFakeRelay(t, "ROOM")
+	f.member(api.Participant{ID: "LAPI", Name: "linux.api", Parent: "LNX", Online: true}, "", "")
+	f.member(api.Participant{ID: "OLDX", Name: "old.x", Parent: "OLD", Online: true}, "", "")
+	f.member(api.Participant{ID: "MAC", Name: "mac", Owner: true, Online: true}, "mac", "MACTOKEN0123456789")
+	f.member(api.Participant{ID: "LNX", Name: "linux", Online: true}, "", "")
+	f.member(api.Participant{ID: "OLD", Name: "old", Revoked: true}, "", "")
+	r := e.hx(http.MethodGet, "/r/mac/participants", nil)
+	must(t, r, http.StatusOK, `data-count="4" data-others="3" data-sessions="2"`, "Removed (1)",
+		`data-name="linux"><div class="mrow">`, `<ul class="kids" aria-label="Sessions"><li class="member session" data-to="LAPI"`)
+	if strings.Count(r.body, `<ul class="kids"`) != 1 {
+		t.Errorf("want linux.api under linux, and old.x on its own:\n%s", r.body)
+	}
+	if i, j := strings.Index(r.body, `data-name="linux"`), strings.Index(r.body, `data-name="old.x"`); i < 0 || j < i {
+		t.Errorf("old.x should follow the machines:\n%s", r.body)
+	}
+	must(t, e.get("/r/mac"), http.StatusOK, `<option value="LNX">linux</option><option value="LAPI">linux.api</option><option value="OLDX">old.x</option>`)
+}
+
+// A message that can't be shown says why in plain words, not as a Go error.
+func TestUndecryptable(t *testing.T) {
+	key, other := e2ee.NewKey(), e2ee.NewKey()
+	h := e2ee.Header{Room: "R", From: "A", ID: "m1"}
+	_, wrongKey := key.Open(h, other.Seal(h, []byte(`{}`)))
+	_, format := key.Open(h, []byte{9, 9})
+	var p api.Payload
+	notJSON, wrongType := json.Unmarshal([]byte("hello"), &p), json.Unmarshal([]byte(`{"depth": "deep"}`), &p)
+	for err, want := range map[error]string{wrongKey: "this room's key", format: "format this version", notJSON: "isn't a message", wrongType: "isn't a message"} {
+		if got := undecryptable(err); !strings.Contains(got, want) || strings.Contains(got, "e2ee") || strings.Contains(got, "json") {
+			t.Errorf("undecryptable(%v) = %q, want %q", err, got, want)
+		}
+	}
 }
 
 func TestLink(t *testing.T) {
@@ -942,6 +990,8 @@ func TestConnectNamesTheRoom(t *testing.T) {
 	must(t, e.get("/r/alice/connect"), http.StatusOK, "join the thread splice room as reviewer</pre>")
 	e.create("other", "alice", "none")
 	must(t, e.get("/r/alice-other/connect"), http.StatusOK, "join the thread splice room other as reviewer</pre>", "names this one")
+	// The room's empty state says the same.
+	must(t, e.get("/r/alice-other"), http.StatusOK, "say “join the thread splice room other” in a Claude chat")
 
 	// The phrase is pasted into a chat as the user's own words: a room name a
 	// relay made up stays out of it.
@@ -954,4 +1004,12 @@ func TestConnectNamesTheRoom(t *testing.T) {
 	r := e.get("/r/mallory/connect")
 	must(t, r, http.StatusOK, "join the thread splice room as reviewer</pre>")
 	mustNot(t, r, "names this one", "room x.")
+	must(t, e.get("/r/mallory"), http.StatusOK, "say “join the thread splice room” in a Claude chat")
+
+	// The name suggested for a Codex member stays a valid name.
+	id.Alias, id.Name = "long", strings.Repeat("m", 30)
+	if err := client.Save(id); err != nil {
+		t.Fatal(err)
+	}
+	must(t, e.get("/r/long/connect"), http.StatusOK, "<code>threadsplice join -as codex</code>")
 }

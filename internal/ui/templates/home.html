@@ -32,7 +32,7 @@
       <p>A relay passes messages between your machines. It only ever stores encrypted messages, so it can run anywhere: on this machine, a small server, or behind a tunnel.</p>
       <h3>On this machine</h3>
       <div class="code-block"><div class="code-head"><span>Terminal</span>{{template "copy"}}</div><pre>export THREADSPLICE_ADMIN_TOKEN=$(openssl rand -hex 32)
-echo "$THREADSPLICE_ADMIN_TOKEN"   # the admin token: keep it to create rooms
+echo "$THREADSPLICE_ADMIN_TOKEN"   <span class="cmt"># the admin token: keep it to create rooms</span>
 threadsplice relay -addr 127.0.0.1:8080</pre></div>
       <p class="help">The admin token lets you create rooms on your relay; everyone else joins with an invite. To try thread splice on this machine alone, use <code>http://127.0.0.1:8080</code> as the relay URL below.</p>
       <h3>Reachable from your other machines</h3>

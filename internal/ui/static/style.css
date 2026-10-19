@@ -25,7 +25,7 @@
   --on-accent: #FFFFFF;
   --danger: #C4262E;
   --danger-tint: #FBECEC;
-  --ok: #18794E;
+  --ok: #146C45; /* 4.8:1 on --fill-2, where Copied sits while hovered */
   --on-ok: #FFFFFF;
   --ask: #B4410F;
   --ask-tint: #FDF0E7;
@@ -102,14 +102,15 @@ svg.i { flex: none; display: block; }
 main { min-width: 0; outline: none; }
 
 .skip {
-  position: absolute; z-index: 100; left: 12px; top: -80px; padding: 8px 14px;
+  position: absolute; z-index: 100; left: 12px; top: -80px; display: inline-flex; align-items: center; min-height: 36px; padding: 0 14px;
   border-radius: 10px; background: var(--surface); color: var(--text); box-shadow: var(--shadow-lg);
 }
 .skip:focus { top: 12px; }
 
-/* A global banner is only for a lost connection or a refused form; white on #C4262E is 5.7:1 in both themes. */
+/* A global banner is only for a lost connection or a refused form; white on #C4262E is 5.7:1 in both themes,
+   and 7.9:1 on its darker code chips (a lighter chip would drop to 4.2:1). */
 .banner { margin: 0; padding: 10px 20px; background: #C4262E; color: #FFFFFF; font-size: 0.875rem; }
-.banner code { background: rgb(255 255 255 / 0.2); color: inherit; }
+.banner code { background: rgb(0 0 0 / 0.2); color: inherit; }
 .banner:empty { display: none; }
 
 /* ---- buttons ---- */
@@ -335,6 +336,7 @@ input[readonly] { background: var(--fill); }
 .copy.icon:hover { background: var(--fill-2); color: var(--text); }
 .err { display: flex; gap: 8px; align-items: flex-start; color: var(--danger); }
 .err svg { margin-top: 2px; }
+.err strong { font-weight: 600; }
 .msg.bad .bubble { border: 1px solid var(--danger); background: var(--danger-tint); }
 .foot { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 10px; margin: 4px 4px 0; font-size: 0.75rem; line-height: 1.33; color: var(--text-2); }
 .waiting { display: inline-flex; align-items: center; gap: 6px; color: var(--ask); font-weight: 600; }
@@ -386,6 +388,7 @@ input[readonly] { background: var(--fill); }
 .hint kbd { font-family: var(--font); font-weight: 600; }
 html[data-os="mac"] .hint [data-os="other"], html[data-os="other"] .hint [data-os="mac"] { display: none; }
 html:not([data-os]) .hint kbd + kbd::before { content: " / "; }
+@media (hover: none) and (pointer: coarse) { .hint .keys { display: none; } } /* a touch screen has no shortcut to show */
 .sent { display: inline-flex; align-items: center; gap: 4px; font-size: 0.8125rem; font-weight: 600; color: var(--ok); }
 .sent svg { width: 14px; height: 14px; }
 .btn.send { min-height: 40px; padding: 0 16px 0 18px; border-radius: 999px; }
@@ -424,8 +427,13 @@ html:not([data-os]) .hint kbd + kbd::before { content: " / "; }
 /* Quiet until aimed at: red is for the removal itself, in the dialog. */
 .btn.remove { min-height: 32px; padding: 0 8px; border-color: transparent; background: transparent; color: var(--text-2); font-size: 0.8125rem; font-weight: 600; }
 .btn.remove:hover, .btn.remove:focus-visible { border-color: var(--danger); color: var(--danger); background: var(--danger-tint); }
+.alone { margin: 8px 6px 0; }
 .removed { margin-top: 12px; padding: 0 6px; }
-.removed summary { min-height: 32px; display: flex; align-items: center; color: var(--text-2); font-size: 0.8125rem; font-weight: 600; cursor: pointer; }
+.removed summary, .more summary { min-height: 32px; display: flex; align-items: center; gap: 4px; color: var(--text-2); font-size: 0.8125rem; font-weight: 600; cursor: pointer; }
+.more summary { display: inline-flex; }
+.removed summary::-webkit-details-marker, .more summary::-webkit-details-marker { display: none; }
+details[open] > summary > svg.i { transform: rotate(180deg); }
+.more[open] > * + * { margin-top: 10px; }
 .removed .mname { color: var(--text-2); text-decoration: line-through; }
 
 /* ---- dialogs ---- */
@@ -500,6 +508,8 @@ dialog.confirm p { color: var(--text-2); }
 .code-head .copy.copied { color: var(--ok); }
 .code-block pre { margin: 0; padding: 12px 14px; font-size: 0.8125rem; line-height: 1.5; white-space: pre; overflow-x: auto; tab-size: 2; }
 .code-block pre.one { user-select: all; -webkit-user-select: all; }
+/* Shell comments: shown, but neither Copy nor a manual selection takes them (zsh would run them as arguments). */
+.cmt { color: var(--text-2); user-select: none; -webkit-user-select: none; }
 .tabs { display: flex; gap: 4px; overflow-x: auto; padding: 4px; border-radius: 12px; background: var(--fill); width: fit-content; max-width: 100%; }
 .tabs a {
   display: inline-flex; align-items: center; min-height: 32px; padding: 0 14px; border-radius: 9px;
@@ -552,7 +562,10 @@ dialog.confirm p { color: var(--text-2); }
   .scroll-in { padding: 16px 16px 12px; }
   .room-head { padding: 14px 16px; }
   .room-head h1 { font-size: 1.25rem; }
-  .room-actions .btn { min-height: 36px; padding: 0 12px; }
+  /* Two quiet buttons side by side, the primary across under them: tidy at any width, and in DOM order. */
+  .room-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr)); flex: 1 1 100%; }
+  .room-actions .btn { padding: 0 12px; }
+  .room-actions .primary { grid-column: 1 / -1; }
   .dock { position: sticky; bottom: 0; z-index: 10; padding: 8px 8px calc(8px + env(safe-area-inset-bottom)); }
   .bubble { max-width: 88%; }
   .page { padding: 20px 16px 48px; }
@@ -582,7 +595,8 @@ dialog.confirm p { color: var(--text-2); }
 
 /* ---- coarse pointers: 44 px targets ---- */
 @media (pointer: coarse) {
-  .btn, .btn.small, .btn.remove, .copy.icon, .newpill, .tabs a, .removed summary, .crumb a, .quote { min-height: 44px; }
+  .btn, .btn.small, .btn.remove, .btn.send, .copy.icon, .newpill, .tabs a, .removed summary, .more summary, .crumb a, .quote,
+  .brand, .skip, .switcher summary { min-height: 44px; }
   .btn.icon, .copy.icon { min-width: 44px; }
   input:not([type=checkbox]), select, .c-opts select { height: 44px; }
   .switch { min-height: 44px; }
@@ -603,4 +617,8 @@ dialog.confirm p { color: var(--text-2); }
   .dot.off, .dot.away { background: Canvas; box-shadow: inset 0 0 0 2px CanvasText; }
   .rooms a[aria-current], .tabs a[aria-current] { outline: 2px solid Highlight; }
   .step.done .tick { forced-color-adjust: none; background: Highlight; color: HighlightText; }
+  /* The Ask switch's knob and on state are backgrounds, which forced colours would erase. */
+  .switch input::before { forced-color-adjust: none; background: CanvasText; }
+  .switch input:checked { forced-color-adjust: none; border-color: Highlight; background: Highlight; }
+  .switch input:checked::before { background: HighlightText; }
 }
