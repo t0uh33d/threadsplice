@@ -220,7 +220,7 @@ func link(rows []row) {
 		r := &rows[i]
 		if r.ReplyTo != "" {
 			if j, ok := at[r.ReplyTo]; ok {
-				rows[j].Answered, r.Quote = true, snippet(rows[j].Text)
+				rows[j].Answered, r.Quote = true, quote(rows[j].Text)
 			}
 		}
 		if r.ID != "" {
@@ -232,6 +232,19 @@ func link(rows []row) {
 			r.Cont = r.Err == "" && p.Err == "" && r.Group != "" && r.Group == p.Group && d < groupGap && d > -groupGap
 		}
 	}
+}
+
+// quote is the start of what a reply answers: the asked message's first
+// block, a code block without its fences, as ui.js quotes rows that arrive later.
+func quote(text string) string {
+	bs := blocks(text)
+	switch {
+	case len(bs) == 0:
+		return ""
+	case bs[0].Code:
+		return snippet(bs[0].Body())
+	}
+	return snippet(bs[0].Text)
 }
 
 // annotate adds what the member list knows about each sender: whether it is

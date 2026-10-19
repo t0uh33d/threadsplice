@@ -866,6 +866,8 @@ func TestLink(t *testing.T) {
 		{ID: "f", Group: "", At: at.Add(10 * time.Minute)},                // unknown sender: never grouped
 		{ID: "g", Group: "R|", ReplyTo: "a", At: at.Add(11 * time.Minute)},
 		{ID: "h", Group: "R|", ReplyTo: "zz", At: at.Add(11 * time.Minute)},
+		{ID: "i", Group: "S|", Kind: "ask", Text: "```go\nx := 1\n```\nIs this right?", At: at.Add(12 * time.Minute)},
+		{ID: "j", Group: "T|", ReplyTo: "i", At: at.Add(13 * time.Minute)}, // quotes the code, not its fences, as ui.js does
 	}
 	link(rows)
 	var cont []string
@@ -877,8 +879,8 @@ func TestLink(t *testing.T) {
 	if !slices.Equal(cont, []string{"b", "h"}) {
 		t.Errorf("grouped: %v", cont)
 	}
-	if !rows[0].Answered || rows[6].Quote != "first question with lines" || rows[7].Quote != "" {
-		t.Errorf("reply links: %+v %+v %+v", rows[0], rows[6], rows[7])
+	if !rows[0].Answered || rows[6].Quote != "first question with lines" || rows[7].Quote != "" || rows[9].Quote != "x := 1" {
+		t.Errorf("reply links: %+v %+v %+v %+v", rows[0], rows[6], rows[7], rows[9])
 	}
 	if s := snippet(strings.Repeat("x", 70)); s != strings.Repeat("x", 60)+"…" {
 		t.Errorf("snippet: %q", s)
