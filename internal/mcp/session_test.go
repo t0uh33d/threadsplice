@@ -980,6 +980,32 @@ func TestSessionBindRace(t *testing.T) {
 	}
 }
 
+// A leave (or a rebind) can stop delivery right after a push: the message is
+// in the session by then, so it must still be acknowledged, or the next join
+// would deliver it again.
+func TestHandOffAcksWhenStopped(t *testing.T) {
+	ctx := context.Background()
+	mac, bob := machineRoom(t)
+	if _, err := bob.Send(ctx, "mac", api.Payload{Kind: api.KindMessage, Text: "once"}); err != nil {
+		t.Fatal(err)
+	}
+	stop, cancel := context.WithCancel(ctx)
+	defer cancel()
+	pushed := 0
+	d := &deliverer{name: "test", push: func(context.Context, string, string) error { pushed++; cancel(); return nil }}
+	s := &server{opt: Options{Log: slog.New(slog.DiscardHandler)}, depths: map[string]int{}}
+	if _, err := s.handOff(stop, &member{Agent: mac}, d, "session"); err != nil || pushed != 1 {
+		t.Fatalf("handOff = %v after %d pushes", err, pushed)
+	}
+	again, err := client.NewAgent(mac.ID) // what the next join starts with
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msgs, _, err := again.Fetch(ctx, -1, 0, ""); err != nil || len(msgs) != 0 {
+		t.Errorf("after the push, the next fetch got %d message(s), %v", len(msgs), err)
+	}
+}
+
 // Each join starts delivery to the session and each leave stops it, so going
 // in and out of a room leaves no deliverer behind.
 func TestSessionRejoinStopsDelivery(t *testing.T) {

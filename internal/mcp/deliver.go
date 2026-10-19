@@ -291,7 +291,12 @@ func (s *server) handOff(ctx context.Context, m *member, d *deliverer, target st
 		s.opt.Log.Info("delivered", "id", msg.ID, "kind", msg.Kind, "via", d.name)
 	}
 	m.pending = m.pending[1:]
-	return len(m.pending) > 0, m.Ack(ctx, msg.Seq)
+	// The session has it now: record that even when delivery is being stopped
+	// (leave and rebinding cancel ctx, possibly right after the push), or the
+	// next join would deliver it again.
+	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	return len(m.pending) > 0, m.Ack(actx, msg.Seq)
 }
 
 // inboxLine is one line on Claude Code's inbox socket.
