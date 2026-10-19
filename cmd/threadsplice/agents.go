@@ -35,9 +35,16 @@ func cmdMCP(ctx context.Context, args []string) error {
 	case !slices.Contains(mcp.Modes, *deliver):
 		return usageError(fmt.Sprintf("mcp: -deliver must be one of %s, not %q", modes, *deliver))
 	}
-	a, err := client.OpenAgent(*as)
-	if err != nil {
-		return err
+	// With an identity named, or a delivery only a fixed identity has, the
+	// server is that identity, as always. Otherwise it starts without one and
+	// initialize decides: a Claude Code session joins rooms on its own, one
+	// session at a time (session mode); anything else gets the default identity.
+	var a *client.Agent
+	if *as != "" || os.Getenv("THREADSPLICE_AS") != "" || *deliver == "channel" || *deliver == "codex" {
+		var err error
+		if a, err = client.OpenAgent(*as); err != nil {
+			return err
+		}
 	}
 	// stdout carries the protocol; diagnostics go to stderr.
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))

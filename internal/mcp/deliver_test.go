@@ -44,9 +44,17 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
+	if os.Getenv("TS_SLEEP") != "" { // re-executed as another Claude Code process (see livePID)
+		time.Sleep(2 * time.Minute)
+		os.Exit(0)
+	}
 	os.Unsetenv("CLAUDE_CODE_MESSAGING_SOCKET") // set when tests run inside Claude Code
 	os.Unsetenv("CLAUDE_CODE_MESSAGING_TOKEN")
 	os.Unsetenv("CLAUDE_CODE_ENTRYPOINT")
+	os.Unsetenv("CLAUDE_CODE_SESSION_ID")
+	os.Unsetenv("CLAUDE_PID")
+	os.Unsetenv("CLAUDE_PROJECT_DIR")
+	os.Unsetenv("THREADSPLICE_AS")
 	home, err := os.MkdirTemp("", "threadsplice-test")
 	if err != nil {
 		panic(err)

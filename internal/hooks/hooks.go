@@ -42,6 +42,8 @@ type input struct {
 	CopilotAgent   string `json:"agentId"`
 	StopHookActive bool   `json:"stop_hook_active"` // this stop follows a block already
 	Prompt         string `json:"prompt"`           // UserPromptSubmit
+	Source         string `json:"source"`           // SessionStart: startup, resume, clear or compact
+	Reason         string `json:"reason"`           // SessionEnd: clear, logout, prompt_input_exit, ...
 }
 
 // output is a hook response; its shape depends on the agent (see withContext, block).
@@ -74,7 +76,8 @@ var events = map[string]string{
 // as identity alias: it reads the hook input from in and writes the agent's
 // JSON response to out, or nothing when there is nothing to say. event
 // defaults to the input's hook_event_name; Copilot CLI sends none, so its
-// hooks pass the event.
+// hooks pass the event. Claude Code's hooks without an identity (no alias,
+// no THREADSPLICE_AS) run in session mode (see sessionHook).
 //
 // Hook never fails. A failed hook would break the user's agent — exit code 2,
 // which is also what an unrecovered Go panic exits with, means "block" to
@@ -111,6 +114,9 @@ func run(ctx context.Context, agent, event, alias string, in io.Reader, out io.W
 	if !ok {
 		return fmt.Errorf("unsupported hook event %q", event)
 	}
+	if agent == "claude" && alias == "" && os.Getenv("THREADSPLICE_AS") == "" {
+		return sessionHook(ctx, ev, p, out)
+	}
 	a, err := client.OpenAgent(alias)
 	if err != nil {
 		return err
@@ -119,6 +125,11 @@ func run(ctx context.Context, agent, event, alias string, in io.Reader, out io.W
 	if err != nil || o == nil {
 		return err
 	}
+	return write(out, o)
+}
+
+// write prints o, the hook's response, as one line.
+func write(out io.Writer, o *output) error {
 	b, err := json.Marshal(o)
 	if err != nil {
 		return err
@@ -272,12 +283,17 @@ type notified struct {
 	Seq       int64  `json:"seq"`
 }
 
+// A session member's record, like its session record, sits in a directory
+// named for its machine membership: <home>/sessions/<parent alias>/<name>.notified.
 func notifiedPath(alias string) (string, error) {
+	if parent, name, child := strings.Cut(alias, "/"); !client.ValidAlias(parent) || child && !api.ValidName(name) {
+		return "", fmt.Errorf("invalid identity name %q", alias)
+	}
 	home, err := client.Home()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, "sessions", alias+".notified"), nil
+	return filepath.Join(home, "sessions", filepath.FromSlash(alias)+".notified"), nil
 }
 
 // announced returns the newest seq already announced to session sid.
@@ -343,11 +359,15 @@ func copilotHooks(alias string) string {
 	return hooksFile("copilot", alias, "sessionStart", "postToolUse", "agentStop", "sessionEnd")
 }
 
-// hooksFile renders a hooks file with one `threadsplice hook` command per event.
-// Claude Code and Codex nest handlers in matcher groups; Copilot lists them
-// directly in a version 1 file, and names the event in the command because
-// its hook input doesn't.
+// hooksFile renders a hooks file with one `threadsplice hook` command per event,
+// as identity alias (none: Claude Code's session mode). Claude Code and Codex
+// nest handlers in matcher groups; Copilot lists them directly in a version 1
+// file, and names the event in the command because its hook input doesn't.
 func hooksFile(agent, alias string, events ...string) string {
+	as := ""
+	if alias != "" {
+		as = " -as " + alias
+	}
 	var b strings.Builder
 	b.WriteString("    {\n")
 	if agent == "copilot" {
@@ -359,9 +379,9 @@ func hooksFile(agent, alias string, events ...string) string {
 		if strings.EqualFold(ev, "SessionEnd") {
 			timeout = 3 // Codex allows SessionEnd hooks 3 s at most
 		}
-		entry := fmt.Sprintf(`{"hooks": [{"type": "command", "command": "threadsplice hook %s -as %s", "timeout": %d}]}`, agent, alias, timeout)
+		entry := fmt.Sprintf(`{"hooks": [{"type": "command", "command": "threadsplice hook %s%s", "timeout": %d}]}`, agent, as, timeout)
 		if agent == "copilot" {
-			entry = fmt.Sprintf(`{"type": "command", "command": "threadsplice hook copilot %s -as %s", "timeoutSec": %d}`, ev, alias, timeout)
+			entry = fmt.Sprintf(`{"type": "command", "command": "threadsplice hook copilot %s%s", "timeoutSec": %d}`, ev, as, timeout)
 		}
 		sep := ","
 		if i == len(events)-1 {
@@ -373,7 +393,8 @@ func hooksFile(agent, alias string, events ...string) string {
 	return b.String()
 }
 
-const claudeSetup = `Claude Code: the terminal CLI and the VS Code extension share this configuration.
+const claudeSetup = `Claude Code: the terminal CLI and the VS Code extension share this configuration. It connects every
+session as NAME; for a member per session instead, run: threadsplice setup claude (without -as)
 
 1. Register the MCP server (tools: send, ask, inbox, peers) for all your projects:
 
@@ -402,6 +423,54 @@ without the flag: those sessions can't show pushed messages.
 
     claude mcp add --scope user threadsplice -- threadsplice mcp -as NAME -deliver channel
     claude --dangerously-load-development-channels server:threadsplice
+`
+
+// SessionSetup returns the configuration that connects Claude Code in session
+// mode: one registration without an identity, after which each session the
+// user picks joins a room as a member of its own. machine is this machine's
+// participant name, or "" when it has none or several.
+func SessionSetup(machine string) string {
+	example := `"<machine>.reviewer"`
+	if api.ValidName(machine) {
+		example = strconv.Quote(machine + ".reviewer")
+	}
+	return claudeSessionSetup + hooksFile("claude", "", "SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd") +
+		strings.Replace(claudeSessionSetupEnd, "EXAMPLE", example, 1)
+}
+
+const claudeSessionSetup = `Claude Code: the terminal CLI and the VS Code extension share this configuration. Each session you
+pick joins a thread splice room as a member of its own; the others stay out.
+
+1. Register the MCP server (tools: join, leave, send, ask, inbox, peers) for all your projects:
+
+    claude mcp add --scope user threadsplice -- threadsplice mcp
+
+2. Recommended: add these hooks to ~/.claude/settings.json, merged into any "hooks" you already have:
+
+`
+
+const claudeSessionSetupEnd = `
+   They show a joined session as idle, busy or away, mention messages still waiting, and keep the
+   session joined across /clear. A session that hasn't joined gets nothing from them, and message
+   text never goes through them: it reaches Claude framed as untrusted input from another agent.
+
+3. In the session you want to connect, say:
+
+    join the thread splice room as reviewer
+
+   Claude asks to run the join tool; allow it. The session then joins as EXAMPLE
+   (this machine's name in the room, a dot, and the label you gave). Without "as ...", the label is
+   the repository's or the folder's name. Messages for that member arrive in that session by
+   themselves; other sessions on this machine stay out until you ask them to join too. Saying
+   "leave the thread splice room" takes a session out: its member stays reserved for this machine,
+   and joining again brings it back. Resuming the conversation (claude --resume) rejoins on its own.
+   threadsplice sessions lists the sessions that joined.
+
+Registered with -as before? Switch: claude mcp remove threadsplice --scope user, run step 1, and
+remove "-as <name>" from the threadsplice hook commands in ~/.claude/settings.json.
+
+On Windows, run Claude Code and threadsplice inside WSL (the extension too, in a WSL window):
+native Windows sessions can't be woken yet, so messages wait for the inbox tool there.
 `
 
 const codexSetup = `Codex CLI (paths are under $CODEX_HOME, ~/.codex by default)

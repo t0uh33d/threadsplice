@@ -131,6 +131,27 @@ func (c *Client) Join(ctx context.Context, invite, name string) (api.Membership,
 	return m, err
 }
 
+// ErrChildrenUnsupported is CreateChild's error from a relay that predates
+// session members.
+var ErrChildrenUnsupported = errors.New("this relay doesn't support session members yet; upgrade threadsplice on the relay")
+
+// CreateChild creates the session member name under this client's machine
+// membership (c.Token is the machine's) for the token whose TokenHash is
+// tokenHash. Retrying with the same hash returns the same member. The
+// membership it returns has no Token: the caller already holds it.
+func (c *Client) CreateChild(ctx context.Context, room, name, tokenHash string) (api.Membership, error) {
+	var m api.Membership
+	err := c.do(ctx, "POST", "/v1/rooms/"+room+"/participants", api.CreateChildRequest{Name: name, TokenHash: tokenHash}, &m)
+	var se *StatusError
+	switch {
+	case errors.As(err, &se) && se.Code == http.StatusMethodNotAllowed: // an old relay serves only GET here
+		return m, ErrChildrenUnsupported
+	case err == nil && (m.RoomID != room || !relayID.MatchString(m.ParticipantID) || !api.ValidName(m.RoomName)): // it goes into a file
+		return api.Membership{}, errors.New("the relay returned an invalid session member")
+	}
+	return m, err
+}
+
 // Participants lists room members with presence and acknowledgement cursors.
 func (c *Client) Participants(ctx context.Context, room string) ([]api.Participant, error) {
 	var ps []api.Participant

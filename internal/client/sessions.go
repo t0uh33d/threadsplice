@@ -18,12 +18,18 @@ type SessionInfo struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// sessionPath is <home>/sessions/<alias>.json; a session member's record
+// lands in a subdirectory named for its parent alias.
 func sessionPath(alias string) (string, error) {
-	p, err := identityPath(alias) // validates alias
+	f, err := aliasFile(alias) // validates alias
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(filepath.Dir(filepath.Dir(p)), "sessions", alias+".json"), nil
+	home, err := Home()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "sessions", f+".json"), nil
 }
 
 // SaveSession records the live session for alias (0600, atomic replace).
@@ -32,35 +38,12 @@ func SaveSession(alias string, s SessionInfo) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-		return err
-	}
 	s.UpdatedAt = time.Now().UTC()
 	b, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(p), ".tmp-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	// On Windows a rename over a file another process has open (the deliverer
-	// polls it) fails transiently; retry briefly.
-	for attempt := 0; ; attempt++ {
-		err = os.Rename(tmp.Name(), p)
-		if err == nil || attempt == 4 {
-			return err
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	return replaceFile(p, b)
 }
 
 // LoadSession returns the live session recorded for alias, if any.

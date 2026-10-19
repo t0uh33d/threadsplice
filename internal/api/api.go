@@ -17,8 +17,9 @@ type CreateRoomRequest struct {
 	Owner string `json:"owner"` // owner's participant name
 }
 
-// Membership is returned when a participant is created (room creation or join).
-// Token is the participant's bearer credential; the relay stores only its hash.
+// Membership is returned when a participant is created (room creation, join,
+// or a session member). Token is the participant's bearer credential; the relay
+// stores only its hash. It is empty for a session member, whose client chose it.
 type Membership struct {
 	RoomID        string `json:"room_id"`
 	RoomName      string `json:"room_name"`
@@ -45,12 +46,21 @@ type JoinRequest struct {
 	Name   string `json:"name"`
 }
 
+// CreateChildRequest creates a session member under the caller's machine
+// membership. The token is chosen by the client; only its hash is sent, so a
+// retry after a lost response is idempotent.
+type CreateChildRequest struct {
+	Name      string `json:"name"`
+	TokenHash string `json:"token_hash"` // lowercase hex SHA-256 of the member's bearer token
+}
+
 // Participant is a room member as the relay sees it.
 type Participant struct {
 	ID       string    `json:"id"`
 	Name     string    `json:"name"`
 	Owner    bool      `json:"owner,omitempty"`
-	State    string    `json:"state,omitempty"` // self-reported, e.g. "idle", "busy"
+	Parent   string    `json:"parent,omitempty"` // a session member's machine membership (participant id)
+	State    string    `json:"state,omitempty"`  // self-reported, e.g. "idle", "busy"
 	LastSeen time.Time `json:"last_seen,omitzero"`
 	Online   bool      `json:"online"`
 	AckedSeq int64     `json:"acked_seq"` // highest message seq the participant has acknowledged

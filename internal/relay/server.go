@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,11 +27,12 @@ import (
 
 // Config configures a relay.
 type Config struct {
-	DBPath        string
-	AdminToken    string        // required to create rooms
-	Retention     time.Duration // messages older than this are deleted; 0 = 30 days
-	SendPerMinute int           // per-participant send rate limit; 0 = 60
-	Log           *slog.Logger
+	DBPath           string
+	AdminToken       string        // required to create rooms
+	Retention        time.Duration // messages older than this are deleted; 0 = 30 days
+	SendPerMinute    int           // per-participant send rate limit, shared with its session members; 0 = 60
+	MembersPerMinute int           // session members a participant may create per minute; 0 = 10
+	Log              *slog.Logger
 }
 
 const (
@@ -46,9 +48,10 @@ type Server struct {
 	store *store
 	hub   hub
 
-	mu    sync.Mutex
-	sends map[string]window   // per-participant send counters
-	pres  map[string]presence // per-participant presence
+	mu      sync.Mutex
+	sends   map[string]window   // per-participant send counters
+	creates map[string]window   // per-participant session member creations
+	pres    map[string]presence // per-participant presence
 }
 
 // presence is kept in memory: it changes on every poll, doesn't need to
@@ -75,6 +78,9 @@ func New(cfg Config) (*Server, error) {
 	if cfg.SendPerMinute == 0 {
 		cfg.SendPerMinute = 60
 	}
+	if cfg.MembersPerMinute == 0 {
+		cfg.MembersPerMinute = 10
+	}
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
@@ -82,7 +88,8 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{cfg: cfg, store: st, hub: hub{ch: map[string]chan struct{}{}}, sends: map[string]window{}, pres: map[string]presence{}}, nil
+	return &Server{cfg: cfg, store: st, hub: hub{ch: map[string]chan struct{}{}},
+		sends: map[string]window{}, creates: map[string]window{}, pres: map[string]presence{}}, nil
 }
 
 // Close closes the database.
@@ -96,6 +103,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/join", s.join)
 	mux.HandleFunc("POST /v1/rooms/{room}/invites", s.auth(s.createInvite))
 	mux.HandleFunc("GET /v1/rooms/{room}/participants", s.auth(s.participants))
+	// Relays from before session members answer POST here with 405, which
+	// clients read as "unsupported".
+	mux.HandleFunc("POST /v1/rooms/{room}/participants", s.auth(s.createChild))
 	mux.HandleFunc("DELETE /v1/rooms/{room}/participants/{pid}", s.auth(s.revoke))
 	mux.HandleFunc("POST /v1/rooms/{room}/messages", s.auth(s.send))
 	mux.HandleFunc("GET /v1/rooms/{room}/messages", s.auth(s.messages))
@@ -228,6 +238,7 @@ func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 	}
 	token := newToken()
 	m, err := s.store.join(r.Context(), hashToken(req.Invite), req.Name, hashToken(token))
+	var cl clash
 	switch {
 	case errors.Is(err, errInvite):
 		httpError(w, http.StatusForbidden, err.Error())
@@ -235,12 +246,74 @@ func (s *Server) join(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, errConflict):
 		httpError(w, http.StatusConflict, fmt.Sprintf("name %q is already taken in this room", req.Name))
 		return
+	case errors.As(err, &cl):
+		httpError(w, http.StatusConflict, cl.Error())
+		return
 	case err != nil:
 		s.internal(w, err)
 		return
 	}
 	m.Token = token
 	s.cfg.Log.Info("participant joined", "room", m.RoomID, "participant", m.ParticipantID)
+	writeJSON(w, http.StatusCreated, m)
+}
+
+// createChild creates a session member: a participant of its own for one agent
+// session, named after the caller (its machine membership) and owned by it. The
+// client picks the member's token and sends only its hash, so retrying a request
+// whose response was lost returns the same member (200) instead of a new one.
+func (s *Server) createChild(w http.ResponseWriter, r *http.Request, c caller) {
+	if c.parent != "" {
+		httpError(w, http.StatusForbidden, "session members can't create members")
+		return
+	}
+	var req api.CreateChildRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	switch {
+	case !tokenHashRe.MatchString(req.TokenHash):
+		httpError(w, http.StatusBadRequest, "token_hash must be the lowercase hex SHA-256 of the member's token (64 characters of [0-9a-f])")
+		return
+	case !api.ValidName(req.Name) || !strings.HasPrefix(req.Name, c.name+".") || len(req.Name) == len(c.name)+1:
+		httpError(w, http.StatusBadRequest, fmt.Sprintf("a session member's name is %q followed by a label, and %s", c.name+".", api.NameRule))
+		return
+	}
+	hash, _ := hex.DecodeString(req.TokenHash) // checked above
+	// The store charges the machine's creation budget, once it knows the
+	// request isn't the free retry of one whose answer was lost.
+	m, created, err := s.store.createChild(r.Context(), c.room, c.id, req.Name, hash, func() bool {
+		return s.allow(s.creates, c.id, s.cfg.MembersPerMinute)
+	})
+	var cl clash
+	switch {
+	case errors.Is(err, errNotFound): // the owner revoked the machine after auth
+		httpError(w, http.StatusUnauthorized, "invalid or revoked credential")
+		return
+	case errors.Is(err, errRate):
+		httpError(w, http.StatusTooManyRequests, fmt.Sprintf("rate limit: %d new session members per minute", s.cfg.MembersPerMinute))
+		return
+	case errors.Is(err, errConflict):
+		httpError(w, http.StatusConflict, fmt.Sprintf("name %q is already taken in this room", req.Name))
+		return
+	case errors.As(err, &cl):
+		httpError(w, http.StatusConflict, cl.Error())
+		return
+	case errors.Is(err, errFull):
+		httpError(w, http.StatusConflict, fmt.Sprintf("this machine already has %d session members; the room owner can remove some", maxChildren))
+		return
+	case errors.Is(err, errTokenUsed):
+		httpError(w, http.StatusConflict, "token_hash is already in use; pick a new token")
+		return
+	case err != nil:
+		s.internal(w, err)
+		return
+	}
+	if !created {
+		writeJSON(w, http.StatusOK, m)
+		return
+	}
+	s.cfg.Log.Info("session member created", "room", c.room, "parent", c.id, "participant", m.ParticipantID)
 	writeJSON(w, http.StatusCreated, m)
 }
 
@@ -305,6 +378,7 @@ func (s *Server) revoke(w http.ResponseWriter, r *http.Request, c caller) {
 	case err != nil:
 		s.internal(w, err)
 	default:
+		s.hub.notify(c.room) // waiting long-polls re-check their credential and end
 		s.cfg.Log.Info("participant revoked", "room", c.room, "participant", r.PathValue("pid"), "by", c.id)
 		w.WriteHeader(http.StatusNoContent)
 	}
@@ -325,7 +399,7 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, c caller) {
 	case req.To == c.id:
 		httpError(w, http.StatusBadRequest, "cannot send a message to yourself")
 		return
-	case !s.allowSend(c.id):
+	case !s.allowSend(c):
 		httpError(w, http.StatusTooManyRequests, fmt.Sprintf("rate limit: %d messages per minute", s.cfg.SendPerMinute))
 		return
 	}
@@ -464,20 +538,32 @@ func (s *Server) auth(h func(http.ResponseWriter, *http.Request, caller)) http.H
 	}
 }
 
-func (s *Server) allowSend(pid string) bool {
+// allowSend charges a send to the caller's window. A session member's sends
+// go to its parent's, so a machine's sessions share one budget.
+func (s *Server) allowSend(c caller) bool {
+	key := c.id
+	if c.parent != "" {
+		key = c.parent
+	}
+	return s.allow(s.sends, key, s.cfg.SendPerMinute)
+}
+
+// allow counts one event against key's window in counters and reports whether
+// it stays within limit per minute.
+func (s *Server) allow(counters map[string]window, key string, limit int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// ponytail: fixed one-minute window per participant; switch to a token bucket if bursts at window edges matter.
 	now := time.Now()
-	win := s.sends[pid]
+	win := counters[key]
 	if now.Sub(win.start) >= time.Minute {
 		win = window{start: now}
 	}
-	if win.n >= s.cfg.SendPerMinute {
+	if win.n >= limit {
 		return false
 	}
 	win.n++
-	s.sends[pid] = win
+	counters[key] = win
 	return true
 }
 
@@ -503,8 +589,9 @@ func hashToken(tok string) []byte {
 }
 
 var (
-	idRe    = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-	stateRe = regexp.MustCompile(`^[a-z_]{1,16}$`)
+	idRe        = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+	stateRe     = regexp.MustCompile(`^[a-z_]{1,16}$`)
+	tokenHashRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 func validID(s string) bool    { return idRe.MatchString(s) }

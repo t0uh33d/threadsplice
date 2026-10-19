@@ -47,8 +47,9 @@ type deliverer struct {
 // setDelivery resolves Options.Deliver for the MCP client that introduced
 // itself as clientName, and returns the mode. auto takes Claude Code's inbox
 // socket under an interactive Claude Code, codex queue under Codex, and
-// otherwise holds messages for the inbox tool. A repeated initialize keeps the
-// first answer: the delivery loop started with it.
+// otherwise holds messages for the inbox tool; session mode has rules of its
+// own (sessionDelivery). A repeated initialize keeps the first answer: the
+// delivery loop started with it.
 func (s *server) setDelivery(clientName string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -57,6 +58,14 @@ func (s *server) setDelivery(clientName string) string {
 	}
 	mode, name := s.opt.Deliver, strings.ToLower(clientName)
 	auto := mode == "" || mode == "auto"
+	switch {
+	case s.sess != nil:
+		s.mode = s.sessionDelivery(auto)
+		return s.mode
+	case s.agent == nil: // the default identity didn't open: nothing to deliver
+		s.mode = "hold"
+		return s.mode
+	}
 	if auto {
 		mode = "hold"
 		switch {
@@ -87,6 +96,21 @@ func (s *server) setDelivery(clientName string) string {
 	}
 	s.mode, s.d = mode, d
 	return mode
+}
+
+// sessionDelivery is setDelivery for session mode, where bindings already
+// guarantee that one live session acts as a member: the bound member's
+// messages go to this Claude Code process's own inbox socket, and the hooks'
+// session records don't come into it. Channels stay with fixed identities.
+func (s *server) sessionDelivery(auto bool) string {
+	ok := runtime.GOOS != "windows" && s.sess.socket != "" // see claudeDeliverer for Windows
+	switch {
+	case ok && (s.opt.Deliver == "claude" || auto && !headless[os.Getenv("CLAUDE_CODE_ENTRYPOINT")]):
+		return "claude"
+	case s.opt.Deliver == "claude":
+		s.opt.Log.Warn("live delivery unavailable; holding messages for the inbox tool", "deliver", "claude", "err", "no inbox socket")
+	}
+	return "hold"
 }
 
 // live returns the delivery mode in effect: "hold" while a deliverer has
@@ -172,11 +196,11 @@ func (s *server) codexDeliverer() (*deliverer, error) {
 	}, nil
 }
 
-// deliver hands each incoming message to the session, one at a time and in
-// order, acknowledging it only once the session has it (at-least-once). After
-// maxFailures failed hand-offs in a row it falls back to hold for good, leaving
-// the message in flight for the inbox tool.
-func (s *server) deliver(ctx context.Context, d *deliverer) {
+// deliver hands each of m's incoming messages to the session, one at a time
+// and in order, acknowledging it only once the session has it (at-least-once).
+// After maxFailures failed hand-offs in a row it falls back to hold for good,
+// leaving the message in flight for the inbox tool.
+func (s *server) deliver(ctx context.Context, m *member, d *deliverer) {
 	var fails, polls int
 	more, holding := false, false
 	for ctx.Err() == nil {
@@ -193,9 +217,9 @@ func (s *server) deliver(ctx context.Context, d *deliverer) {
 		if !more {
 			// Wait for something to arrive without holding recvMu, so inbox calls
 			// never queue behind a 25 s poll. This only wakes us; handOff fetches.
-			envs, err := s.agent.Relay.Messages(ctx, s.agent.ID.RoomID, -1, 25*time.Second, "")
+			envs, err := m.Relay.Messages(ctx, m.ID.RoomID, -1, 25*time.Second, "")
 			if err != nil {
-				if ctx.Err() != nil {
+				if ctx.Err() != nil || s.gone(m, err) {
 					return
 				}
 				polls++
@@ -212,9 +236,9 @@ func (s *server) deliver(ctx context.Context, d *deliverer) {
 			}
 		}
 		var err error
-		more, err = s.handOff(ctx, d, target)
+		more, err = s.handOff(ctx, m, d, target)
 		switch {
-		case ctx.Err() != nil:
+		case ctx.Err() != nil, s.gone(m, err):
 			return
 		case errors.Is(err, errHandOff):
 			if fails++; fails >= maxFailures {
@@ -237,37 +261,37 @@ func (s *server) deliver(ctx context.Context, d *deliverer) {
 	}
 }
 
-// handOff pushes the oldest message waiting for this session and acknowledges
-// it once pushed; more reports whether others are still waiting. It holds
-// recvMu, so the inbox tool and the deliverer never both present a message.
-// A message whose push fails stays in s.pending, where the next try (or the
-// inbox tool) picks it up: the client drops repeat fetches of a message it has
-// already seen, so it can't simply be fetched again.
-func (s *server) handOff(ctx context.Context, d *deliverer, target string) (more bool, err error) {
-	s.recvMu.Lock()
-	defer s.recvMu.Unlock()
-	if len(s.pending) == 0 {
-		msgs, last, err := s.agent.Fetch(ctx, -1, 0, "")
+// handOff pushes the oldest message waiting for m and acknowledges it once
+// pushed; more reports whether others are still waiting. It holds m.recvMu,
+// so the inbox tool and the deliverer never both present a message. A message
+// whose push fails stays in m.pending, where the next try (or the inbox tool)
+// picks it up: the client drops repeat fetches of a message it has already
+// seen, so it can't simply be fetched again.
+func (s *server) handOff(ctx context.Context, m *member, d *deliverer, target string) (more bool, err error) {
+	m.recvMu.Lock()
+	defer m.recvMu.Unlock()
+	if len(m.pending) == 0 {
+		msgs, last, err := m.Fetch(ctx, -1, 0, "")
 		if err != nil || len(msgs) == 0 {
 			if err == nil && last > 0 { // only replays the client dropped: move past them
-				err = s.agent.Ack(ctx, last)
+				err = m.Ack(ctx, last)
 			}
 			return false, err
 		}
 		s.remember(msgs)
-		s.pending = msgs
+		m.pending = msgs
 	}
-	m := s.pending[0]
-	if m.Err != nil {
+	msg := m.pending[0]
+	if msg.Err != nil {
 		// No content for the model, and a turn would cost tokens: log it and move on, as bridges do.
-		s.opt.Log.Warn("skipping undecryptable message", "id", m.ID, "from", m.FromName)
-	} else if err := d.push(ctx, target, client.Envelope(s.agent.ID.RoomName, m, false)); err != nil {
+		s.opt.Log.Warn("skipping undecryptable message", "id", msg.ID, "from", msg.FromName)
+	} else if err := d.push(ctx, target, client.Envelope(m.ID.RoomName, msg, false)); err != nil {
 		return true, fmt.Errorf("%w: %w", errHandOff, err)
 	} else {
-		s.opt.Log.Info("delivered", "id", m.ID, "kind", m.Kind, "via", d.name)
+		s.opt.Log.Info("delivered", "id", msg.ID, "kind", msg.Kind, "via", d.name)
 	}
-	s.pending = s.pending[1:]
-	return len(s.pending) > 0, s.agent.Ack(ctx, m.Seq)
+	m.pending = m.pending[1:]
+	return len(m.pending) > 0, m.Ack(ctx, msg.Seq)
 }
 
 // inboxLine is one line on Claude Code's inbox socket.

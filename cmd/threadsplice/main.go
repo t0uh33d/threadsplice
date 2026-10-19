@@ -10,10 +10,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"regexp"
 	"runtime/debug"
+	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -31,11 +34,13 @@ Relay (run on your server, behind TLS):
   threadsplice relay [-addr :8080] [-db threadsplice.db]     needs THREADSPLICE_ADMIN_TOKEN
 
 Rooms and identities:
-  threadsplice room create -relay URL -name ROOM -as NAME    create a room, print an invite
+  threadsplice room create -relay URL -name ROOM [-as NAME]  create a room, print an invite
   threadsplice invite [-as NAME]                             print a new single-use invite (owner)
-  threadsplice join -as NAME INVITE                          join a room from another machine
+  threadsplice join [-as NAME] [INVITE]                      join a room from another machine; type or
+                                                             paste the invite when asked, or pipe it in
   threadsplice revoke [-as NAME] PARTICIPANT                 remove a participant (owner)
-  threadsplice identities                                    list identities on this machine
+  threadsplice identities                                    list identities and session members here
+  threadsplice sessions                                      list Claude Code sessions that joined a room
 
 Web UI (local, loopback only):
   threadsplice ui [-addr 127.0.0.1:4848] [-open]             rooms, invites and the live conversation
@@ -53,7 +58,10 @@ Agent integration:
   threadsplice bridge codex [-as NAME] [-cwd DIR] ...        headless Codex answering the room
   threadsplice bridge acp [-as NAME] -- AGENT [ARGS...]      headless ACP agent (Copilot, Gemini, OpenCode...)
 
-Identity selection: -as NAME, else $THREADSPLICE_AS, else the only identity.
+Identity selection: -as NAME, else $THREADSPLICE_AS, else the only identity. A session member is
+MACHINE/MEMBER (see identities). room create and join name this machine's membership after its
+kind (mac, linux, wsl, windows) unless -as says otherwise.
+Claude Code without -as joins rooms one session at a time: see threadsplice setup claude.
 Exit codes: 0 ok, 1 error, 2 usage.
 `
 
@@ -91,7 +99,7 @@ func run(ctx context.Context, args []string) error {
 		return cmdRelay(ctx, args)
 	case "room":
 		if len(args) == 0 || args[0] != "create" {
-			return usageError("usage: threadsplice room create -relay URL -name ROOM -as NAME")
+			return usageError("usage: threadsplice room create -relay URL -name ROOM [-as NAME]")
 		}
 		return cmdRoomCreate(ctx, args[1:])
 	case "invite":
@@ -102,6 +110,8 @@ func run(ctx context.Context, args []string) error {
 		return cmdRevoke(ctx, args)
 	case "identities":
 		return cmdIdentities()
+	case "sessions":
+		return cmdSessions(args)
 	case "peers":
 		return cmdPeers(ctx, args)
 	case "send":
@@ -165,14 +175,14 @@ func cmdRoomCreate(ctx context.Context, args []string) error {
 	fs := flags("room create")
 	relayURL := fs.String("relay", os.Getenv("THREADSPLICE_RELAY"), "relay base URL, e.g. https://relay.example.com")
 	name := fs.String("name", "", "room name")
-	as := fs.String("as", "", "your participant name in the room")
+	as := fs.String("as", "", "this machine's participant name in the room (default "+client.DefaultMachineName()+")")
 	adminToken := fs.String("admin-token", "", "relay admin token (default $THREADSPLICE_ADMIN_TOKEN)")
 	ttl := fs.Duration("invite-ttl", 24*time.Hour, "how long the printed invite stays valid")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
-	if *relayURL == "" || *name == "" || *as == "" {
-		return usageError("room create needs -relay, -name and -as")
+	if *relayURL == "" || *name == "" {
+		return usageError("room create needs -relay and -name")
 	}
 	if err := client.CheckRelayURL(*relayURL); err != nil {
 		return err
@@ -180,10 +190,17 @@ func cmdRoomCreate(ctx context.Context, args []string) error {
 	if *adminToken == "" {
 		*adminToken = os.Getenv("THREADSPLICE_ADMIN_TOKEN")
 	}
-	if _, err := client.Load(*as); err == nil {
-		return fmt.Errorf("identity %q already exists on this machine; pick another -as name", *as)
+	owner, alias := *as, *as
+	if owner == "" {
+		owner = client.DefaultMachineName()
+		var err error
+		if alias, err = localName(owner, *name); err != nil {
+			return err
+		}
+	} else if _, err := client.Load(owner); err == nil {
+		return fmt.Errorf("identity %q already exists on this machine; pick another -as name", owner)
 	}
-	m, err := client.New(*relayURL, *adminToken).CreateRoom(ctx, *name, *as)
+	m, err := client.New(*relayURL, *adminToken).CreateRoom(ctx, *name, owner)
 	if err != nil {
 		return err
 	}
@@ -191,13 +208,52 @@ func cmdRoomCreate(ctx context.Context, args []string) error {
 		return fmt.Errorf("the relay returned an invalid room name")
 	}
 	key := e2ee.NewKey() // generated here; the relay never sees it
-	id := client.Identity{Alias: *as, Relay: strings.TrimRight(*relayURL, "/"), RoomID: m.RoomID, RoomName: m.RoomName,
-		ParticipantID: m.ParticipantID, Name: *as, Owner: true, Token: m.Token, RoomKey: key.String()}
+	id := client.Identity{Alias: alias, Relay: strings.TrimRight(*relayURL, "/"), RoomID: m.RoomID, RoomName: m.RoomName,
+		ParticipantID: m.ParticipantID, Name: owner, Owner: true, Machine: true, Token: m.Token, RoomKey: key.String()}
 	if err := client.Save(id); err != nil {
 		return err
 	}
-	fmt.Printf("Created room %q; you are %q.\n", m.RoomName, *as)
-	return printInvite(ctx, id, *ttl)
+	fmt.Printf("Created room %q; you are %q%s.\n", m.RoomName, owner, savedAs(id))
+	if err := printInvite(ctx, id, *ttl); err != nil {
+		return err
+	}
+	fmt.Println(nextStep)
+	return nil
+}
+
+// nextStep follows room create and join.
+const nextStep = "Next, connect Claude Code on this machine (once): threadsplice setup claude"
+
+// localName picks the local name of a new machine membership whose name the
+// user didn't choose: its participant name, or, when this machine already
+// uses that for another room, <name>-<room>, then -2 … -9, as the web UI does.
+// -as selects by local name; peers see the participant name.
+func localName(name, room string) (string, error) {
+	taken, err := client.List()
+	if err != nil {
+		return "", err
+	}
+	base := name + "-" + room
+	base = base[:min(len(base), 60)]
+	cands := []string{name, base}
+	for i := 2; i <= 9; i++ {
+		cands = append(cands, base+"-"+strconv.Itoa(i))
+	}
+	for _, c := range cands {
+		// EqualFold: on case-insensitive disks (macOS, Windows) Mac.json is mac.json.
+		if client.ValidAlias(c) && !slices.ContainsFunc(taken, func(t string) bool { return strings.EqualFold(t, c) }) {
+			return c, nil
+		}
+	}
+	return "", fmt.Errorf("this machine already has identities named %q, %q and %q-2 … -9: pass -as", name, base, base)
+}
+
+// savedAs mentions an identity's local name when it isn't its participant name.
+func savedAs(id client.Identity) string {
+	if id.Alias == id.Name {
+		return ""
+	}
+	return fmt.Sprintf(" (saved here as %q: use -as %s)", id.Alias, id.Alias)
 }
 
 func cmdInvite(ctx context.Context, args []string) error {
@@ -223,15 +279,23 @@ func printInvite(ctx context.Context, id client.Identity, ttl time.Duration) err
 	if err != nil {
 		return err
 	}
-	// The token goes into a shell command the user pastes elsewhere: a relay
-	// must not be able to slip shell syntax into it.
+	// The user pastes the token elsewhere, possibly into a shell: a relay must
+	// not be able to slip shell syntax into it.
 	if !inviteToken.MatchString(inv.Token) {
 		return fmt.Errorf("the relay returned a malformed invite token")
 	}
+	// The invite is printed on its own, and the other machine reads it at a
+	// prompt: in a command line it would land in shell history and the
+	// process list.
 	fmt.Printf(`
 Invite (single use, expires %s). It contains the room key: share it privately.
 
-  threadsplice join -as <name> '%s'
+  %s
+
+On the other machine:
+  curl -fsSL https://github.com/t0uh33d/threadsplice/releases/latest/download/install.sh | sh
+  threadsplice join          # paste the invite when asked
+(or: go install github.com/t0uh33d/threadsplice/cmd/threadsplice@latest)
 
 `, inv.ExpiresAt.Local().Format(time.RFC1123), client.FormatInvite(id.Relay, inv.Token, key))
 	return nil
@@ -240,39 +304,83 @@ Invite (single use, expires %s). It contains the room key: share it privately.
 // inviteToken is the shape of the invite tokens the relay mints (base64url).
 var inviteToken = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
 
+const joinUsage = "usage: threadsplice join [-as NAME] [INVITE] (without INVITE, type or paste it when asked, or pipe it in)"
+
 func cmdJoin(ctx context.Context, args []string) error {
 	fs := flags("join")
-	as := fs.String("as", "", "your participant name in the room")
-	if err := parse(fs, args); err != nil {
+	as := fs.String("as", "", "this machine's participant name in the room (default "+client.DefaultMachineName()+")")
+	pos, err := parseMixed(fs, args)
+	if err != nil {
 		return err
 	}
-	if *as == "" || fs.NArg() != 1 {
-		return usageError("usage: threadsplice join -as NAME INVITE")
+	if len(pos) > 1 {
+		return usageError(joinUsage)
 	}
-	relayURL, token, key, err := client.ParseInvite(fs.Arg(0))
+	invite := ""
+	if len(pos) == 1 {
+		invite = pos[0]
+	} else if invite, err = readInvite(ctx, os.Stdin, os.Stderr); err != nil {
+		return err
+	}
+	relayURL, token, key, err := client.ParseInvite(invite)
 	if err != nil {
 		return err
 	}
 	if err := client.CheckRelayURL(relayURL); err != nil {
 		return err
 	}
-	if _, err := client.Load(*as); err == nil {
-		return fmt.Errorf("identity %q already exists on this machine; pick another -as name", *as)
+	name, defaulted := *as, *as == ""
+	if defaulted {
+		name = client.DefaultMachineName()
+	} else if _, err := client.Load(name); err == nil {
+		return fmt.Errorf("identity %q already exists on this machine; pick another -as name", name)
 	}
-	m, err := client.New(relayURL, "").Join(ctx, token, *as) // the key stays local
+	c := client.New(relayURL, "") // the key stays local
+	m, name, err := joinAs(name, defaulted, func(name string) (api.Membership, error) { return c.Join(ctx, token, name) })
 	if err != nil {
 		return err
 	}
 	if !api.ValidName(m.RoomName) { // it reaches models later; the relay must not slip text in
 		return fmt.Errorf("the relay returned an invalid room name")
 	}
-	id := client.Identity{Alias: *as, Relay: relayURL, RoomID: m.RoomID, RoomName: m.RoomName,
-		ParticipantID: m.ParticipantID, Name: *as, Token: m.Token, RoomKey: key.String()}
+	alias := name
+	if defaulted {
+		if alias, err = localName(name, m.RoomName); err != nil {
+			return err
+		}
+	}
+	id := client.Identity{Alias: alias, Relay: relayURL, RoomID: m.RoomID, RoomName: m.RoomName,
+		ParticipantID: m.ParticipantID, Name: name, Machine: true, Token: m.Token, RoomKey: key.String()}
 	if err := client.Save(id); err != nil {
 		return err
 	}
-	fmt.Printf("Joined room %q as %q.\n", m.RoomName, *as)
+	fmt.Printf("Joined room %q as %q%s.\n", m.RoomName, name, savedAs(id))
+	fmt.Println(nextStep)
 	return nil
+}
+
+// joinAs redeems an invite as name through join. A name the user didn't
+// choose moves on to name-2 … name-9 while another member has it; a chosen
+// one doesn't. It returns the name the relay took.
+func joinAs(name string, defaulted bool, join func(name string) (api.Membership, error)) (api.Membership, string, error) {
+	names := []string{name}
+	if defaulted {
+		for i := 2; i <= 9; i++ {
+			names = append(names, name+"-"+strconv.Itoa(i))
+		}
+	}
+	var m api.Membership
+	var err error
+	for _, n := range names {
+		m, err = join(n)
+		if se := (*client.StatusError)(nil); !errors.As(err, &se) || se.Code != http.StatusConflict {
+			return m, n, err
+		}
+	}
+	if defaulted {
+		err = fmt.Errorf("%q and %q-2 … -9 are all taken in this room, so pick a name with -as (%w)", name, name, err)
+	}
+	return m, name, err
 }
 
 func cmdRevoke(ctx context.Context, args []string) error {
@@ -298,12 +406,23 @@ func cmdRevoke(ctx context.Context, args []string) error {
 				return err
 			}
 			fmt.Printf("Revoked %q. Their access ends now; anything they already received stays readable to them.\n", p.Name)
+			members := 0
+			for _, c := range ps {
+				if c.Parent == p.ID && !c.Revoked {
+					members++
+				}
+			}
+			if members > 0 { // the relay revokes a machine's session members with it
+				fmt.Printf("Its %d session member(s) are revoked with it.\n", members)
+			}
 			return nil
 		}
 	}
 	return fmt.Errorf("no participant %q in room %q", fs.Arg(0), a.ID.RoomName)
 }
 
+// cmdIdentities lists the identities on this machine, each machine
+// membership with its session members indented under it.
 func cmdIdentities() error {
 	names, err := client.List()
 	if err != nil {
@@ -318,6 +437,49 @@ func cmdIdentities() error {
 			continue
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", n, id.RoomName, id.Name, id.Relay)
+		kids, err := client.ListChildren(n)
+		if err != nil {
+			fmt.Fprintf(w, "  %s/…\t(unreadable: %v)\t\t\n", n, err)
+			continue
+		}
+		for _, k := range kids {
+			name := k.Name
+			if k.ParticipantID == "" {
+				name += " (unfinished)" // the relay never confirmed it; the next join finishes or drops it
+			}
+			fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n", k.Alias, k.RoomName, name, k.Relay)
+		}
+	}
+	return w.Flush()
+}
+
+// cmdSessions lists the Claude Code sessions on this machine that joined a
+// room as a member of their own: live while a Claude Code process shows the
+// conversation, stale otherwise (resuming it rejoins).
+func cmdSessions(args []string) error {
+	if len(args) > 0 {
+		return usageError("usage: threadsplice sessions")
+	}
+	bs, err := client.Bindings()
+	if err != nil {
+		return err
+	}
+	if len(bs) == 0 {
+		fmt.Println("No Claude Code session on this machine has joined a room. To join one, say in it: join the thread splice room")
+		return nil
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "MEMBER\tROOM\tSESSION\tSTATUS")
+	for _, b := range bs {
+		room := "?"
+		if id, err := client.LoadChild(b.Machine, b.Child); err == nil {
+			room = id.RoomName
+		}
+		status := "stale"
+		if b.Live() {
+			status = "live"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", b.Child, room, b.SessionID[:min(8, len(b.SessionID))], status)
 	}
 	return w.Flush()
 }

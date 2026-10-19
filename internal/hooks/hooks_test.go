@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -424,6 +425,22 @@ func TestHookNeverBreaks(t *testing.T) {
 	down := httptest.NewServer(http.NotFoundHandler())
 	down.Close()
 	saveIdentity(t, down.URL)
+	// Session mode (Claude Code without -as): a session joined as a member on
+	// that relay, one bound to a member whose file is gone, and one whose
+	// binding can't be read.
+	t.Setenv("CLAUDE_PID", strconv.Itoa(os.Getpid()))
+	if err := client.SaveChild(client.Identity{Relay: down.URL, RoomID: "r1", RoomName: "proj", ParticipantID: "p2", Name: "alice.repo",
+		Parent: "p1", ParentAlias: "alice", Token: "token2", RoomKey: e2ee.NewKey().String()}); err != nil {
+		t.Fatal(err)
+	}
+	for sid, child := range map[string]string{"cc-joined": "alice.repo", "cc-orphan": "alice.gone"} {
+		if err := client.SaveBinding(client.Binding{SessionID: sid, Machine: "alice", Child: child, PID: os.Getpid()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(os.Getenv("THREADSPLICE_HOME"), "bindings", "cc-garbled.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	for _, c := range []struct {
 		name, agent, event, alias string
 		in                        io.Reader
@@ -437,6 +454,13 @@ func TestHookNeverBreaks(t *testing.T) {
 		{"Copilot input without the event argument", "copilot", "", "alice", strings.NewReader(copilotStop)},
 		{"input over 1 MiB", "claude", "", "alice", strings.NewReader(`{"hook_event_name":"Stop","pad":"` + strings.Repeat("x", maxInput) + `"}`)},
 		{"panic", "claude", "", "alice", nil},
+		{"session mode: relay down", "claude", "", "", strings.NewReader(`{"session_id":"cc-joined","hook_event_name":"Stop"}`)},
+		{"session mode: relay down at SessionStart", "claude", "", "", strings.NewReader(`{"session_id":"cc-joined","hook_event_name":"SessionStart","source":"resume"}`)},
+		{"session mode: member file gone", "claude", "", "", strings.NewReader(`{"session_id":"cc-orphan","hook_event_name":"UserPromptSubmit","prompt":"x"}`)},
+		{"session mode: binding unreadable", "claude", "", "", strings.NewReader(`{"session_id":"cc-garbled","hook_event_name":"PostToolUse"}`)},
+		{"session mode: session id that could leave the directory", "claude", "", "", strings.NewReader(`{"session_id":"../x","hook_event_name":"SessionStart","source":"startup"}`)},
+		{"session mode: no session id", "claude", "", "", strings.NewReader(`{"hook_event_name":"Stop"}`)},
+		{"session mode: panic", "claude", "", "", nil},
 	} {
 		var out, errOut bytes.Buffer
 		Hook(context.Background(), c.agent, c.event, c.alias, c.in, &out, &errOut)
@@ -450,9 +474,17 @@ func TestHookNeverBreaks(t *testing.T) {
 
 	t.Setenv("THREADSPLICE_HOME", t.TempDir()) // no identity at all
 	var out, errOut bytes.Buffer
-	Hook(context.Background(), "claude", "", "", strings.NewReader(claudeStart), &out, &errOut)
+	Hook(context.Background(), "codex", "", "", strings.NewReader(codexStart), &out, &errOut)
 	if out.Len() != 0 || !strings.Contains(errOut.String(), "no identity") {
 		t.Errorf("no identity: stdout %q, stderr %q", out.String(), errOut.String())
+	}
+	// Claude Code without -as is session mode: a session that hasn't joined
+	// says nothing at all, identities or not.
+	out.Reset()
+	errOut.Reset()
+	Hook(context.Background(), "claude", "", "", strings.NewReader(claudeStart), &out, &errOut)
+	if out.Len() != 0 || errOut.Len() != 0 {
+		t.Errorf("session mode, no identity: stdout %q, stderr %q", out.String(), errOut.String())
 	}
 }
 

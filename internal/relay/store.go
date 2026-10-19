@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -14,10 +15,46 @@ import (
 )
 
 var (
-	errNotFound = errors.New("not found")
-	errConflict = errors.New("conflict")
-	errInvite   = errors.New("invite is invalid, expired or already used")
+	errNotFound  = errors.New("not found")
+	errConflict  = errors.New("conflict")
+	errInvite    = errors.New("invite is invalid, expired or already used")
+	errFull      = errors.New("too many session members")
+	errTokenUsed = errors.New("token hash already in use")
+	errRate      = errors.New("rate limited")
 )
+
+// A clash refuses a name that would blur who is who in a room, because of
+// member, a participant there already (revoked ones too: they keep their
+// names). Names are told apart ignoring letter case, and a top-level member's
+// name and a dot begin the names of its sessions and of nobody else's.
+type clash struct {
+	name, member string
+	kind         clashKind
+}
+
+type clashKind int
+
+const (
+	sameName clashKind = iota // member's name in other letter case
+	inside                    // a name in member's namespace
+	around                    // a name whose namespace would take member in
+)
+
+func (c clash) Error() string {
+	switch c.kind {
+	case sameName:
+		return fmt.Sprintf("name %q is already taken in this room, as %q: letter case doesn't tell names apart", c.name, c.member)
+	case inside:
+		return fmt.Sprintf("names starting with %q belong to member %q's sessions, in any letter case", c.member+".", c.member)
+	}
+	return fmt.Sprintf("name %q would make member %q, already in this room, look like one of its sessions", c.name, c.member)
+}
+
+// maxChildren caps a machine membership's live session members.
+const maxChildren = 32
+
+// schemaVersion is the user_version of a current database.
+const schemaVersion = 2
 
 // Composite foreign keys on (room_id, participant) make cross-room references
 // impossible at the database level, not just in handler code.
@@ -62,7 +99,27 @@ CREATE TABLE messages (
 	FOREIGN KEY (room_id, recipient_id) REFERENCES participants (room_id, id) ON DELETE CASCADE
 );
 CREATE INDEX messages_room_seq ON messages (room_id, seq);
-PRAGMA user_version = 1;
+` + schemaV2 + `
+PRAGMA user_version = 2;
+`
+
+// schemaV2 adds session members: participants a machine membership creates
+// for single agent sessions, one level deep. It is a side table because
+// rebuilding participants would break the composite foreign keys into it.
+const schemaV2 = `
+CREATE TABLE children (
+	room_id   TEXT NOT NULL,
+	child_id  TEXT PRIMARY KEY,
+	parent_id TEXT NOT NULL,
+	CHECK (child_id <> parent_id),
+	FOREIGN KEY (room_id, child_id)  REFERENCES participants (room_id, id) ON DELETE CASCADE,
+	FOREIGN KEY (room_id, parent_id) REFERENCES participants (room_id, id) ON DELETE CASCADE
+);
+CREATE INDEX children_parent ON children (parent_id);
+CREATE TRIGGER children_one_level BEFORE INSERT ON children
+WHEN EXISTS (SELECT 1 FROM children WHERE child_id = NEW.parent_id)
+	OR EXISTS (SELECT 1 FROM children WHERE parent_id = NEW.child_id)
+BEGIN SELECT RAISE(ABORT, 'session members are one level deep'); END;
 `
 
 type store struct{ db *sql.DB }
@@ -83,19 +140,27 @@ func openStore(path string) (*store, error) {
 		db.Close()
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
+	// Each step runs in one transaction, user_version included, so a failed
+	// migration leaves the database as it was.
+	var ddl string
 	switch v {
 	case 0:
+		ddl = schema
+	case 1:
+		ddl = schemaV2 + "PRAGMA user_version = 2;"
+	case schemaVersion:
+	default:
+		db.Close()
+		return nil, fmt.Errorf("database schema v%d is newer than this relay (v%d); upgrade threadsplice", v, schemaVersion)
+	}
+	if ddl != "" {
 		if err := inTx(context.Background(), db, func(tx *sql.Tx) error {
-			_, err := tx.Exec(schema)
+			_, err := tx.Exec(ddl)
 			return err
 		}); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("migrate: %w", err)
 		}
-	case 1:
-	default:
-		db.Close()
-		return nil, fmt.Errorf("database schema v%d is newer than this relay (v1); upgrade threadsplice", v)
 	}
 	return &store{db}, nil
 }
@@ -147,12 +212,34 @@ func (s *store) join(ctx context.Context, inviteHash []byte, name string, tokenH
 		} else if err != nil {
 			return err
 		}
-		var taken int
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM participants WHERE room_id = ? AND name = ?`, m.RoomID, name).Scan(&taken); err != nil {
+		// No newcomer may pass as another member, nor as one of a member's
+		// sessions, whoever joined first (see clash).
+		var other string
+		err = tx.QueryRowContext(ctx, `SELECT name FROM participants WHERE room_id = ? AND lower(name) = lower(?) ORDER BY name <> ? LIMIT 1`,
+			m.RoomID, name, name).Scan(&other)
+		switch {
+		case err == nil && other == name:
+			return errConflict
+		case err == nil:
+			return clash{name, other, sameName}
+		case !errors.Is(err, sql.ErrNoRows):
 			return err
 		}
-		if taken > 0 {
-			return errConflict
+		err = tx.QueryRowContext(ctx, `SELECT p.name FROM participants p WHERE p.room_id = ? AND substr(lower(?), 1, length(p.name) + 1) = lower(p.name) || '.'
+			AND NOT EXISTS (SELECT 1 FROM children c WHERE c.child_id = p.id) ORDER BY length(p.name) LIMIT 1`, m.RoomID, name).Scan(&other)
+		if err == nil {
+			return clash{name, other, inside}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		// A dotted name may have joined first: then nobody takes the name it
+		// would pass for a session of.
+		err = tx.QueryRowContext(ctx, `SELECT name FROM participants WHERE room_id = ? AND substr(lower(name), 1, length(?) + 1) = lower(?) || '.'
+			ORDER BY length(name) LIMIT 1`, m.RoomID, name, name).Scan(&other)
+		if err == nil {
+			return clash{name, other, around}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE invites SET used_at = ? WHERE token_hash = ?`, now, inviteHash); err != nil {
 			return err
@@ -168,26 +255,118 @@ func (s *store) join(ctx context.Context, inviteHash []byte, name string, tokenH
 	return m, err
 }
 
-type caller struct {
-	id, room string
-	owner    bool
+// createChild creates the session member name under parent, the caller's
+// machine membership, as long as allow, which charges the parent's creation
+// budget, agrees. A retry with the same token hash returns the member it
+// created, with created false, and costs nothing: it is how a client recovers
+// from a lost answer, so the budget must not stand in its way.
+func (s *store) createChild(ctx context.Context, roomID, parent, name string, tokenHash []byte, allow func() bool) (m api.Membership, created bool, err error) {
+	m = api.Membership{RoomID: roomID}
+	err = inTx(ctx, s.db, func(tx *sql.Tx) error {
+		// auth accepted the parent, but the owner may have revoked it since: a
+		// member created now would have escaped the cascade.
+		var parentName string
+		err := tx.QueryRowContext(ctx, `SELECT p.name, r.name FROM participants p JOIN rooms r ON r.id = p.room_id
+			WHERE p.id = ? AND p.room_id = ? AND p.revoked_at IS NULL`, parent, roomID).Scan(&parentName, &m.RoomName)
+		if errors.Is(err, sql.ErrNoRows) {
+			return errNotFound
+		} else if err != nil {
+			return err
+		}
+		// A taken name may be this very member: the retry of a request whose
+		// response was lost.
+		var id, taken, under string
+		var hash []byte
+		var revoked bool
+		err = tx.QueryRowContext(ctx, `SELECT p.id, p.name, p.token_hash, p.revoked_at IS NOT NULL, coalesce(c.parent_id, '')
+			FROM participants p LEFT JOIN children c ON c.child_id = p.id WHERE p.room_id = ? AND lower(p.name) = lower(?)
+			ORDER BY p.name <> ? LIMIT 1`, roomID, name, name).Scan(&id, &taken, &hash, &revoked, &under)
+		switch {
+		case err == nil && taken == name && !revoked && under == parent && bytes.Equal(hash, tokenHash):
+			m.ParticipantID = id
+			return nil
+		case err != nil && !errors.Is(err, sql.ErrNoRows):
+			return err
+		case !allow():
+			return errRate
+		case err == nil && taken == name:
+			return errConflict
+		case err == nil:
+			return clash{name, taken, sameName}
+		}
+		// The name starts with the caller's and a dot (the handler checked).
+		// Rooms from before these rules can still hold a member named like the
+		// caller in other letter case, or like the caller plus a dot and more,
+		// whom a member with this name would pass for a session of. One whose
+		// namespace holds the caller's own name doesn't count: the caller's
+		// sessions look no more like its than the caller does.
+		var owner string
+		err = tx.QueryRowContext(ctx, `SELECT p.name FROM participants p WHERE p.room_id = ? AND p.id <> ? AND length(p.name) >= length(?)
+			AND substr(lower(?), 1, length(p.name) + 1) = lower(p.name) || '.'
+			AND NOT EXISTS (SELECT 1 FROM children c WHERE c.child_id = p.id) ORDER BY length(p.name) DESC LIMIT 1`,
+			roomID, parent, parentName, name).Scan(&owner)
+		if err == nil {
+			return clash{name, owner, inside}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		var n int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM children c JOIN participants p ON p.id = c.child_id
+			WHERE c.parent_id = ? AND p.revoked_at IS NULL`, parent).Scan(&n); err != nil {
+			return err
+		}
+		if n >= maxChildren {
+			return errFull
+		}
+		// The client picked the token, so it may have reused one; the unique
+		// index would refuse it below, as an internal error.
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM participants WHERE token_hash = ?`, tokenHash).Scan(&n); err != nil {
+			return err
+		}
+		if n > 0 {
+			return errTokenUsed
+		}
+		m.ParticipantID = rand.Text()
+		// Like a newcomer through join, a session member starts at the room's cursor.
+		if _, err := tx.ExecContext(ctx, `INSERT INTO participants (id, room_id, name, token_hash, acked_seq, created_at)
+			VALUES (?, ?, ?, ?, (SELECT coalesce(max(seq), 0) FROM messages WHERE room_id = ?), ?)`,
+			m.ParticipantID, roomID, name, tokenHash, roomID, ms(time.Now())); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO children (room_id, child_id, parent_id) VALUES (?, ?, ?)`, roomID, m.ParticipantID, parent)
+		created = err == nil
+		return err
+	})
+	return m, created, err
 }
 
-// auth resolves a bearer token hash to an active (non-revoked) participant.
+type caller struct {
+	id, room, name string
+	owner          bool
+	parent         string // a session member's machine membership; empty at the top level
+}
+
+// auth resolves a bearer token hash to an active participant: not revoked,
+// and for a session member, under a parent that isn't revoked either.
+// Revoking a parent revokes its members too; the parent check is defence in depth.
 func (s *store) auth(ctx context.Context, tokenHash []byte) (caller, error) {
 	var c caller
-	err := s.db.QueryRowContext(ctx, `SELECT id, room_id, owner FROM participants WHERE token_hash = ? AND revoked_at IS NULL`,
-		tokenHash).Scan(&c.id, &c.room, &c.owner)
+	err := s.db.QueryRowContext(ctx, `SELECT p.id, p.room_id, p.name, p.owner, coalesce(c.parent_id, '') FROM participants p
+		LEFT JOIN children c ON c.child_id = p.id LEFT JOIN participants pp ON pp.id = c.parent_id
+		WHERE p.token_hash = ? AND p.revoked_at IS NULL AND pp.revoked_at IS NULL`,
+		tokenHash).Scan(&c.id, &c.room, &c.name, &c.owner, &c.parent)
 	if errors.Is(err, sql.ErrNoRows) {
 		return c, errNotFound
 	}
 	return c, err
 }
 
-// active reports whether pid is still a non-revoked participant.
+// active reports whether pid is still a participant that auth accepts.
 func (s *store) active(ctx context.Context, pid string) bool {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM participants WHERE id = ? AND revoked_at IS NULL`, pid).Scan(&n)
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM participants p
+		LEFT JOIN children c ON c.child_id = p.id LEFT JOIN participants pp ON pp.id = c.parent_id
+		WHERE p.id = ? AND p.revoked_at IS NULL AND pp.revoked_at IS NULL`, pid).Scan(&n)
 	return err == nil && n == 1
 }
 
@@ -195,8 +374,8 @@ func (s *store) active(ctx context.Context, pid string) bool {
 // in by the server from memory; the schema's state and last_seen columns are
 // unused since presence moved there.
 func (s *store) participants(ctx context.Context, roomID string) ([]api.Participant, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, owner, acked_seq, revoked_at IS NOT NULL
-		FROM participants WHERE room_id = ? ORDER BY created_at`, roomID)
+	rows, err := s.db.QueryContext(ctx, `SELECT p.id, p.name, p.owner, coalesce(c.parent_id, ''), p.acked_seq, p.revoked_at IS NOT NULL
+		FROM participants p LEFT JOIN children c ON c.child_id = p.id WHERE p.room_id = ? ORDER BY p.created_at`, roomID)
 	if err != nil {
 		return nil, err
 	}
@@ -204,7 +383,7 @@ func (s *store) participants(ctx context.Context, roomID string) ([]api.Particip
 	var out []api.Participant
 	for rows.Next() {
 		var p api.Participant
-		if err := rows.Scan(&p.ID, &p.Name, &p.Owner, &p.AckedSeq, &p.Revoked); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.Owner, &p.Parent, &p.AckedSeq, &p.Revoked); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -212,16 +391,23 @@ func (s *store) participants(ctx context.Context, roomID string) ([]api.Particip
 	return out, rows.Err()
 }
 
+// revoke revokes an active participant and, in the same transaction, its
+// session members.
 func (s *store) revoke(ctx context.Context, roomID, pid string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE participants SET revoked_at = ? WHERE room_id = ? AND id = ? AND revoked_at IS NULL`,
-		ms(time.Now()), roomID, pid)
-	if err != nil {
+	now := ms(time.Now())
+	return inTx(ctx, s.db, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE participants SET revoked_at = ? WHERE room_id = ? AND id = ? AND revoked_at IS NULL`,
+			now, roomID, pid)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return errNotFound
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE participants SET revoked_at = ?
+			WHERE revoked_at IS NULL AND id IN (SELECT child_id FROM children WHERE parent_id = ?)`, now, pid)
 		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return errNotFound
-	}
-	return nil
+	})
 }
 
 // insertMessage durably accepts a message. Retries with the same (sender, id)

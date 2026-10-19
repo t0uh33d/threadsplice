@@ -67,6 +67,10 @@ func (a *Agent) Peers(ctx context.Context) ([]api.Participant, error) {
 	if err != nil {
 		return nil, err
 	}
+	ids := make(map[string]bool, len(ps))
+	for _, p := range ps {
+		ids[p.ID] = true
+	}
 	a.mu.Lock()
 	for i, p := range ps {
 		// Names reach models (envelopes, notices); a relay is not trusted to
@@ -77,17 +81,22 @@ func (a *Agent) Peers(ctx context.Context) ([]api.Participant, error) {
 		if !peerState.MatchString(p.State) {
 			ps[i].State = ""
 		}
+		// Nor to make a session member's parent another participant here.
+		if !relayID.MatchString(p.Parent) || p.Parent == p.ID || !ids[p.Parent] {
+			ps[i].Parent = ""
+		}
 		a.names[p.ID] = ps[i].Name
 	}
 	a.mu.Unlock()
 	return ps, nil
 }
 
-// The relay's rules for names, states and message ids. Applied again here
-// because the relay is not trusted with anything that reaches a model.
+// The relay's rules for names, states and ids. Applied again here because the
+// relay is not trusted with anything that reaches a model.
 var (
 	peerState = regexp.MustCompile(`^[a-z_]{0,16}$`)
 	messageID = regexp.MustCompile(`^[A-Za-z0-9_-]{0,64}$`)
+	relayID   = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`) // participant ids
 	// frameClose matches the closing tag of Format's frame in any letter case
 	// or spacing a model might still read as one.
 	// ponytail: ASCII only; Unicode look-alikes of < and / still get through.
