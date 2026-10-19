@@ -6,7 +6,7 @@
 
 ---
 
-> **Status: early work in progress.** Everything below is implemented and tested against protocol-accurate fakes of each agent. Live delivery into Claude Code is verified with a fixed identity. Session members, now Claude Code's default, and the other agents still need live checks (see [Status](#status)). No release is published yet, and nothing here is production-ready.
+> **Status: early work in progress.** Everything below is implemented and tested against protocol-accurate fakes of each agent. Live delivery into Claude Code is verified, with fixed identities and with session members (Claude Code's default). The other agents still need live checks (see [Status](#status)). v0.1.0 is a first preview; nothing here is production-ready.
 
 Claude Code on your laptop asks Codex on a Linux box to review a diff. The answer arrives back in Claude's own session and it carries on, with no copy-paste.
 
@@ -68,13 +68,13 @@ Claude Code is registered once per machine, without a member name. Each session 
 
 ## Quick start
 
-**1. Install** on each machine. From the first release on, one line installs the binary into `~/.local/bin` on macOS, Linux or WSL, with no Go and no root. It checks the download against the release's checksums, and against its build attestation when `gh` is installed and logged in ([docs/releasing.md](docs/releasing.md)):
+**1. Install** on each machine. One line installs the binary into `~/.local/bin` on macOS, Linux or WSL, with no Go and no root. It checks the download against the release's checksums, and against its build attestation when `gh` is installed and logged in ([docs/releasing.md](docs/releasing.md)):
 
 ```sh
 curl -fsSL https://github.com/t0uh33d/threadsplice/releases/latest/download/install.sh | sh
 ```
 
-No release is published yet. Until then, build it with Go 1.26+:
+Or build it with Go 1.26+:
 
 ```sh
 go install github.com/t0uh33d/threadsplice/cmd/threadsplice@latest
@@ -164,7 +164,7 @@ threadsplice bridge codex -as codex-bot -cwd ~/src/myproject
 | Bridges: Codex app-server, Agent Client Protocol | Implemented; real-agent verification under way |
 | Local web UI (`threadsplice ui`) | Works; tested, security-reviewed, and driven in a real browser |
 | Copilot Chat idle wake (Agent Host Protocol) | Planned |
-| Binary releases (`release.yml`) and `install.sh` | Workflow written; its build steps and the installer have run locally, not yet on GitHub. No release published yet |
+| Binary releases (`release.yml`) and `install.sh` | **v0.1.0 published** by the workflow: six platforms, SHA256SUMS and a build attestation. The one-line installer was run against it on macOS (arm64); the attestation check needs `gh` and wasn't run there |
 | Docker Compose deployment | Written; not yet verified |
 
 ## Security

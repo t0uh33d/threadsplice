@@ -136,4 +136,4 @@ A second machine should need one pasted line, with no Go and no root.
 - **Integrity.** The release carries `SHA256SUMS` and a build-provenance attestation for every file listed there. The tests run in a job without write access or the signing token.
 - **`install.sh`** (POSIX sh) picks the archive for the machine, fails closed on a missing or wrong checksum, checks the attestation when `gh` is logged in, and installs into `~/.local/bin` without sudo. It runs the new binary before replacing the old one.
 
-No release is published yet. [releasing.md](releasing.md) covers cutting one and verifying a download.
+The first release is v0.1.0. [releasing.md](releasing.md) covers cutting one and verifying a download.
