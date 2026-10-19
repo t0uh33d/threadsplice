@@ -37,6 +37,8 @@ gh attestation verify threadsplice_linux_amd64.tar.gz --repo t0uh33d/threadsplic
 
 The checksum shows that the file matches the release's `SHA256SUMS`. The attestation shows more: it's signed through Sigstore with the release workflow's identity, and it names the commit that was built. Replacing an archive and its `SHA256SUMS` line on the release page can't fake that. Without `--signer-workflow`, gh accepts a signature from any workflow in the repository. `install.sh` runs this same command, so keep the workflow's file name.
 
+`install.sh` is listed in `SHA256SUMS` and attested as well. To check it before you run it, download it next to `SHA256SUMS` and run the same two commands, with `install.sh` in place of the archive; then run it with `sh install.sh`.
+
 ## Immutable releases
 
 The maintainer should turn on GitHub's immutable releases: in the repository's **Settings**, under **Releases**, select **Enable release immutability**. It covers releases published after it's turned on. A published release's assets then can't be added, changed or deleted, and its tag can't be moved or deleted, so a leaked token can't swap a binary under an existing version. `gh release create` uploads the assets to a draft and publishes it afterwards, so the workflow keeps working with the setting on.

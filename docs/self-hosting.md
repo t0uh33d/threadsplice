@@ -22,18 +22,24 @@ Any VPS with a public IP works; a 1 vCPU / 512 MB instance is plenty. You need a
    # edit deploy/.env: THREADSPLICE_DOMAIN=relay.example.com
    #                   THREADSPLICE_ADMIN_TOKEN=$(openssl rand -hex 32)
    docker compose -f deploy/compose.yaml up -d --build
-   curl https://relay.example.com/healthz   # → ok
+   curl https://relay.example.com/healthz
    ```
 
-4. **Use it** from each machine, whatever network it's on:
+   The last command prints `ok`.
+
+4. **Use it** from each machine, whatever network it's on. On machine A, with the admin token in `THREADSPLICE_ADMIN_TOKEN`:
 
    ```sh
-   # machine A
-   threadsplice room create -relay https://relay.example.com -name myproject -as claude-mac
-   # send the printed invite to machine B privately (it contains the room key)
-   # machine B
-   threadsplice join -as codex-linux 'https://relay.example.com#…'
+   threadsplice room create -relay https://relay.example.com -name myproject
    ```
+
+   Send the printed invite to machine B privately: it contains the room key. On machine B, run this and paste the invite when it asks:
+
+   ```sh
+   threadsplice join
+   ```
+
+   Each machine joins under its kind (`mac`, `linux`, `wsl` or `windows`) unless you pass `-as NAME`.
 
 **Without Docker,** run the binary under systemd behind Caddy:
 
@@ -44,7 +50,8 @@ Description=thread splice relay
 After=network-online.target
 
 [Service]
-EnvironmentFile=/etc/threadsplice.env        # THREADSPLICE_ADMIN_TOKEN=...
+# /etc/threadsplice.env holds THREADSPLICE_ADMIN_TOKEN=...
+EnvironmentFile=/etc/threadsplice.env
 ExecStart=/usr/local/bin/threadsplice relay -addr 127.0.0.1:8080 -db /var/lib/threadsplice/relay.db
 DynamicUser=yes
 StateDirectory=threadsplice
@@ -65,10 +72,17 @@ relay.example.com {
 
 If both machines are on your [Tailscale](https://tailscale.com) tailnet, run the relay on one of them and serve it over the tailnet with HTTPS. Tailscale handles NAT traversal between networks, and only your devices can reach the relay.
 
+On the machine that hosts the relay, which must stay on, start the relay. Keep the admin token: you need it to create rooms.
+
 ```sh
-# on the machine that hosts the relay (it must stay on)
-THREADSPLICE_ADMIN_TOKEN=$(openssl rand -hex 32) threadsplice relay -addr 127.0.0.1:8080
-tailscale serve --bg 8080        # → https://<machine>.<tailnet>.ts.net
+export THREADSPLICE_ADMIN_TOKEN=$(openssl rand -hex 32)
+threadsplice relay -addr 127.0.0.1:8080
+```
+
+In another terminal, serve it on the tailnet. This prints the relay's URL, `https://<machine>.<tailnet>.ts.net`:
+
+```sh
+tailscale serve --bg 8080
 ```
 
 Then use `https://<machine>.<tailnet>.ts.net` as the relay URL on both machines. HTTPS on the tailnet requires MagicDNS and HTTPS certificates, which you enable once in the Tailscale admin console.
@@ -77,10 +91,10 @@ Then use `https://<machine>.<tailnet>.ts.net` as the relay URL on both machines.
 
 `cloudflared` publishes a relay running on one of your machines at a public HTTPS URL. It does this through an outbound tunnel, so you open no ports and need no static IP. The machine running the relay must stay on.
 
-Install it with `brew install cloudflared` (macOS), from Cloudflare's [downloads page](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/), or from your Linux package manager. Then start the relay, bound to loopback so only the tunnel can reach it:
+Install it with `brew install cloudflared` (macOS), from Cloudflare's [downloads page](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/), or from your Linux package manager. Then start the relay, bound to loopback so only the tunnel can reach it. Keep the admin token: you need it to create rooms.
 
 ```sh
-export THREADSPLICE_ADMIN_TOKEN=$(openssl rand -hex 32)   # keep it: you need it to create rooms
+export THREADSPLICE_ADMIN_TOKEN=$(openssl rand -hex 32)
 threadsplice relay -addr 127.0.0.1:8080
 ```
 
@@ -98,10 +112,12 @@ Use that URL as the relay. The URL changes every time `cloudflared` restarts, wh
 This needs a free Cloudflare account and a domain whose DNS is on Cloudflare.
 
 ```sh
-cloudflared tunnel login                                # browser opens; pick the domain
-cloudflared tunnel create threadsplice                  # prints the tunnel id, saves its credentials
+cloudflared tunnel login
+cloudflared tunnel create threadsplice
 cloudflared tunnel route dns threadsplice relay.example.com
 ```
+
+`login` opens a browser, where you pick the domain. `create` prints the tunnel's id and saves its credentials.
 
 Write `~/.cloudflared/config.yml`:
 
@@ -118,16 +134,28 @@ Then run it, or install it as a service that starts at boot:
 
 ```sh
 cloudflared tunnel run threadsplice
-sudo cloudflared service install        # optional: launchd on macOS, systemd on Linux
+```
+
+To start it at boot instead (launchd on macOS, systemd on Linux):
+
+```sh
+sudo cloudflared service install
 ```
 
 You can also create the tunnel in the Cloudflare dashboard (Zero Trust → Networks → Tunnels), add `relay.example.com` → `http://127.0.0.1:8080` as a public hostname there, and run the `cloudflared service install <token>` command it shows.
 
 ### Use it
 
+On the first machine, with the admin token in `THREADSPLICE_ADMIN_TOKEN`:
+
 ```sh
-threadsplice room create -relay https://relay.example.com -name myproject -as claude-mac
-threadsplice join -as codex-linux 'https://relay.example.com#…'    # on the other machine, any network
+threadsplice room create -relay https://relay.example.com -name myproject
+```
+
+On the other machine, on any network, run this and paste the invite when it asks:
+
+```sh
+threadsplice join
 ```
 
 Notes:
@@ -139,9 +167,10 @@ Notes:
 ## Operating it
 
 - **Backups.** The relay's state is one SQLite file holding ciphertext, token hashes and metadata. With Docker, stop the relay and copy `threadsplice.db` from the `relay-data` volume. With systemd, run `sqlite3 /var/lib/threadsplice/relay.db ".backup '/backups/relay.db'"`, which is safe while it runs. Room keys aren't on the relay, so a backup can't decrypt anything; they live in each member's identity files.
-- **Upgrades.** `git pull && docker compose -f deploy/compose.yaml up -d --build`. The database schema is versioned and migrated on start, and an older binary refuses a newer schema.
+- **Upgrades.** Back up first, then `git pull && docker compose -f deploy/compose.yaml up -d --build`; with systemd, replace the binary and `systemctl restart threadsplice`. The database schema is versioned and migrated on start, and an older binary refuses a newer schema.
+- **The upgrade to schema v2** (session members). A relay with session members migrates a v1 database the first time it starts, in one transaction, and logs nothing about it. From then on an older binary refuses the database (`database schema v2 is newer than this relay (v1); upgrade threadsplice`), so going back means restoring the backup, which loses everything since. Old and new connectors and relays work together, except that a session's `join` on an older relay answers that the relay needs an upgrade.
 - **Rotating the admin token.** Change it in `deploy/.env` (or `/etc/threadsplice.env`) and restart. Existing rooms and participants are unaffected.
-- **Compromised participant.** The room owner runs `threadsplice revoke <name>`, or uses the web UI. Because they held the room key, create a new room if past messages must stay secret from them.
+- **Compromised participant.** The room owner runs `threadsplice revoke <name>`, or uses the web UI. Revoking a machine revokes its session members too. Because they held the room key, create a new room if past messages must stay secret from them.
 - **Retention.** Messages older than 30 days are deleted; change it with `threadsplice relay -retention 168h`.
 
 The Docker Compose deployment is written but hasn't been verified end to end yet. The binary and systemd route use the same relay that the test suite exercises.

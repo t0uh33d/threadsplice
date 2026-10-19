@@ -11,26 +11,27 @@ go test -race -count=1 ./...
 "$(go env GOROOT)/bin/gofmt" -l .   # must print nothing; a plain `gofmt` may come from an older local Go
 ```
 
-CI runs vet, the race tests and `go build -trimpath` on Linux, macOS and Windows. gofmt runs on Linux only, and `govulncheck` is a separate Linux job.
+CI runs vet, the race tests and `go build -trimpath` on Linux, macOS and Windows. gofmt runs on Linux only, and `govulncheck` is a separate Linux job. The `install` job runs `install.sh` against a local copy of a release, on Linux and macOS.
 
 ## Layout
 
 | Path | Role |
 |---|---|
-| `cmd/threadsplice/` | CLI. `main.go` holds the core subcommands. `mcp` (in `agents.go`), `setup`, `hook`, `ui` and `bridge` (`bridge.go`, which dispatches to `bridge_codex.go` and `bridge_acp.go`) register into `extra` from their own files |
+| `cmd/threadsplice/` | CLI. `main.go` holds the core subcommands, `sessions` included; `tty.go` reads an invite at a hidden prompt. `mcp` (in `agents.go`), `setup`, `hook`, `ui` and `bridge` (`bridge.go`, which dispatches to `bridge_codex.go` and `bridge_acp.go`) register into `extra` from their own files |
 | `internal/api` | Wire types and `ValidName` |
 | `internal/e2ee` | Room key, seal/open |
-| `internal/relay` | HTTP API and SQLite store |
-| `internal/client` | Relay client; identity and session files; `Agent` (seal/open, replay dedupe); the `Envelope` and `Format` frames |
-| `internal/mcp` | stdio MCP server and live deliverers: Claude inbox socket, `codex queue`, channel push, or hold |
-| `internal/hooks` | Lifecycle hooks, and the `setup` text for each agent |
+| `internal/relay` | HTTP API and SQLite store (schema v2) |
+| `internal/client` | Relay client; identity and session files; session members (`children.go`), bindings (`bindings.go`), the memberships a session can join under (`machines.go`), `DefaultMachineName` (`machinename.go`); `Agent` (seal/open, replay dedupe); the `Envelope` and `Format` frames |
+| `internal/mcp` | stdio MCP server; session mode and the `join`/`leave` tools (`session.go`); live deliverers: Claude inbox socket, `codex queue`, channel push, or hold |
+| `internal/hooks` | Lifecycle hooks (session mode in `session.go`), and the `setup` text for each agent |
 | `internal/bridge` | Headless bridges: `codex` (app-server) and `acp` |
-| `internal/ui` | Local HTMX web UI |
+| `internal/ui` | Local HTMX web UI: home, room, and the Connect (`connect.html`) and Invite (`invites.html`) views |
+| `.github/workflows/release.yml`, `install.sh` | Binary releases on a `v*` tag, and the installer ([docs/releasing.md](docs/releasing.md)) |
 | `deploy/`, `Dockerfile` | Caddy and relay via Docker Compose. Not verified end to end |
 
 ## Invariants
 
-- **The relay never sees plaintext or room keys.** The key lives only in the invite's URL fragment and in identity files (`0600` in a `0700` directory). `client.Save` never overwrites, because it creates the file with `os.Link`.
+- **The relay never sees plaintext or room keys.** The key lives only in the invite's URL fragment and in identity and session-member files (`0600` in a `0700` directory). `client.Save` never overwrites, because it creates the file with `os.Link`.
 - **Peer text reaches a model only inside an untrusted-input frame.**
   - Pushed into a session (Claude inbox, `codex queue`, bridge turns): `client.Envelope`. Every envelope starts with `client.EnvelopePrefix`, which Codex's UserPromptSubmit hook relies on.
   - In `inbox`/`ask` results and in the CLI: `client.Format`'s `<threadsplice-message>` tags.
@@ -62,7 +63,8 @@ CI runs vet, the race tests and `go build -trimpath` on Linux, macOS and Windows
 
 - **Relays and connectors upgrade separately.** The relay decodes requests with `DisallowUnknownFields`, so a new request field must be `omitempty` and sent only when used.
 - **The relay's `schema` const applies only to an empty database.** A schema change needs a migration case in `openStore` and a `user_version` bump. Tests always start from a fresh database, so they won't catch a missing migration.
-- **`Identity.Alias` can differ from `Identity.Name`.** The alias is the file name, what `-as` selects, and the key for session and bridge files; the name is what peers see. The UI saves name clashes as `<name>-<room>[-N]`.
+- **`Identity.Alias` can differ from `Identity.Name`.** The alias is the file name, what `-as` selects, and the key for session and bridge files; the name is what peers see. The UI and the CLI's default names save clashes as `<name>-<room>[-N]`. A session member's alias is `<parent alias>/<name>`.
+- **`POST /v1/rooms/{room}/participants`** (session members) answers 405 on relays from before it, which registered only GET there. The client maps that to `client.ErrChildrenUnsupported`.
 
 ## Gotchas
 
@@ -70,13 +72,20 @@ CI runs vet, the race tests and `go build -trimpath` on Linux, macOS and Windows
   - Under `-deliver auto`, the headless entrypoints `sdk-cli`, `sdk-ts`, `sdk-py` and `claude-code-github-action` hold. Native Windows (a named pipe) always holds.
   - The VS Code extension reports `claude-vscode` and has the socket.
   - Deliveries are paced 2 s apart (`claudePace`). The socket gives no receipt.
-- **Fence the environment in tests**, as `internal/mcp`'s `TestMain` does: a temp `THREADSPLICE_HOME`, an empty `THREADSPLICE_AS`, and `CLAUDE_CODE_MESSAGING_*` and `CLAUDE_CODE_ENTRYPOINT` unset. Run from inside a Claude session, an unfenced test can post into that session or touch real identities.
+- **Session mode** (Claude Code without `-as`; see the identity model in [docs/architecture.md](docs/architecture.md)).
+  - It's decided at `initialize`: a client whose name contains "claude", with a valid `CLAUDE_CODE_SESSION_ID`. `-as`, `THREADSPLICE_AS` and `-deliver channel|codex` keep a fixed identity; anything else gets the default identity.
+  - Bindings are keyed by the Claude session id (`bindings/<id>.json`). `bindings/pid-<pid>.json` records the conversation each Claude Code process shows, because the MCP server keeps the session id it was spawned with.
+  - Claude Code doesn't document the order of SessionStart and the MCP server's `initialize`, and `claude --continue` can hand the server the startup session id. At `initialize` the server keeps a pid record its own process wrote (newer than the process's inbox socket) and replaces only an earlier process's. It re-reads the binding before every tool call and, while it delivers live, every 2 s.
+  - `join` carries `_meta["anthropic/requiresUserInteraction"]`: Claude Code asks the user for every join in every mode, and `dontAsk` refuses it. Background tests pre-join on the session's behalf (docs/live-testing.md).
+  - SessionEnd(reason `clear`) fires before SessionStart(source `clear`). SessionEnd must keep the pid record, or `/clear` can't move the binding.
+  - Session-member files live in `children/<parent alias>/`, outside `identities/`, so `List` and `Load("")` never see them. They are never overwritten: `SaveChild` writes the token before the relay call (pending, no participant id) and completes the file once. `DeleteChild` removes only a pending one.
+- **Fence the environment in tests**, as `internal/mcp`'s `TestMain` does: a temp `THREADSPLICE_HOME`, `THREADSPLICE_AS` empty, and `CLAUDE_CODE_MESSAGING_*`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`, `CLAUDE_PROJECT_DIR` and `CLAUDE_CODE_ENTRYPOINT` unset. Run from inside a Claude session, an unfenced test can post into that session, bind to it, or touch real identities.
 - **Codex.**
   - `-c mcp_servers={}` doesn't disable MCP servers. The bridge runs Codex under its own `CODEX_HOME`, which holds only a symlink to `auth.json`.
   - Peer text enters as `toolOutput`, which needs Codex ≥ 0.151. The bridge fails closed when Codex reports an older version or rejects the field.
 - **The relay's long-poll cap** (`maxWait`, 30 s) must stay under the client's 60 s HTTP timeout and under proxy read timeouts.
 - **`seq` is relay-wide,** so it has gaps within a room. Participants resume from their server-side `acked_seq`.
-- **Setup text** replaces every literal `NAME` with the alias, so keep that word out of the prose. `TestSetup` matches phrases that must not wrap across lines. Vendor config formats there follow the vendors' docs as of October 2026; re-check those docs before changing them.
+- **Setup text** replaces every literal `NAME` with the alias, so keep that word out of the prose. `TestSetup` matches phrases that must not wrap across lines. Vendor config formats there follow the vendors' docs as of October 2026; re-check those docs before changing them. The UI's Connect view has its own copy of the session-mode hooks (`claudeHooks` in `internal/ui/room.go`): keep the two in step.
 
 ## Conventions
 

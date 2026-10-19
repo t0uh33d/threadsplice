@@ -37,7 +37,7 @@ Local-only tools on one machine: [claude-peers-mcp](https://github.com/louislva/
 
 | Protocol | Used? | Why |
 |---|---|---|
-| MCP (stdio) | Yes | Every target agent loads MCP servers. Gives the `send`, `ask`, `inbox` and `peers` tools, and the per-session process that delivers messages. |
+| MCP (stdio) | Yes | Every target agent loads MCP servers. Gives the `send`, `ask`, `inbox` and `peers` tools (plus `join` and `leave` for Claude Code sessions), and the per-session process that delivers messages. |
 | Claude Code channels (`notifications/claude/channel`) | Opt-in | The official push contract, but a research preview: CLI-only for custom servers, behind flags and org policy. |
 | Claude Code cross-session inbox (`CLAUDE_CODE_MESSAGING_SOCKET`) | Yes | Documented per-session socket. Our MCP server is a child of the session, so its messages are delivered, not held. Works in the VS Code extension. |
 | Codex app-server | Yes | The supported programmatic interface. Peer messages go in as `toolOutput`, which has tool-level authority, below the user's. |
