@@ -1,5 +1,5 @@
 # Relay image: a static binary on distroless, running as non-root.
-FROM golang:1.27.2 AS build
+FROM golang:1.27.3 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
