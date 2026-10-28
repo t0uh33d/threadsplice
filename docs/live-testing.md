@@ -99,3 +99,5 @@ Clean up afterwards, including after a failed step. `claude agents --json` lists
 claude stop <id> && claude rm <id>
 kill <relay pid>; rm -rf <files dir>
 ```
+
+Background sessions also leave their transcripts in `~/.claude/projects/`, in a folder named after the session's working directory with `/` turned into `-`. Delete it with its own command, from outside the files dir: Claude Code's safety check refuses an `rm -rf` that includes the current working directory, and refuses the whole command with it.

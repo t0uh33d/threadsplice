@@ -373,8 +373,9 @@ var (
 	sends    = map[string]any{"readOnlyHint": false, "destructiveHint": false, "openWorldHint": true}
 )
 
-// maxWaitSeconds keeps blocking tool calls under Codex's default 300 s MCP tool
-// timeout: a call it abandons would have its messages acknowledged unseen.
+// maxWaitSeconds keeps blocking tool calls under the 300 s tool_timeout_sec
+// that `setup codex` configures (Codex's documented default is 60 s): a call
+// Codex abandons would have its messages acknowledged unseen.
 const maxWaitSeconds = 240
 
 var toolDefs = []map[string]any{

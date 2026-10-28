@@ -20,6 +20,8 @@ jobs:
       - if: runner.os == 'Linux'
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - run: go vet ./...
+      # An explicit `shell: bash` runs with pipefail, so a failing test still
+      # fails the step through the tee; the default shell would not.
       - run: go test -race -count=1 ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
         shell: bash
       # Job logs need admin rights; annotations don't. Put the failing lines

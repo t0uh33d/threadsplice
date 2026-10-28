@@ -11,7 +11,7 @@ go test -race -count=1 ./...
 "$(go env GOROOT)/bin/gofmt" -l .   # must print nothing; a plain `gofmt` may come from an older local Go
 ```
 
-CI runs vet, the race tests and `go build -trimpath` on Linux, macOS and Windows. gofmt runs on Linux only, and `govulncheck` is a separate Linux job. The `install` job runs `install.sh` against a local copy of a release, on Linux and macOS.
+CI runs vet, the race tests and `go build -trimpath` on Linux, macOS and Windows. gofmt runs on Linux only, and `govulncheck` is a separate Linux job. The `install` job runs `install.sh` against a local copy of a release, on Linux and macOS. Job logs need admin rights, so when a test fails, the test job also copies the failing lines into the run's annotations (`GET /repos/t0uh33d/threadsplice/check-runs/<job id>/annotations`). That step pipes `go test` through `tee`, so keep its explicit `shell: bash`, which is what gives the pipe `pipefail`.
 
 ## Layout
 
@@ -37,7 +37,7 @@ CI runs vet, the race tests and `go build -trimpath` on Linux, macOS and Windows
   - In `inbox`/`ask` results and in the CLI: `client.Format`'s `<threadsplice-message>` tags.
   - In channel mode: channel events.
 
-  Peer text never goes into hook output, MCP `instructions` or any other high-authority channel. `Format` escapes `</threadsplice-message`; escape the closing tag of any new frame you add.
+  Peer text never goes into hook output, MCP `instructions` or any other high-authority channel. `Format` escapes `</threadsplice-message` in any letter case and spacing (`frameClose`); escape the closing tag of any new frame you add the same way.
 - **Hooks print fixed notices, counts, and `api.ValidName`-checked, quoted names.** Never message text. `threadsplice hook` must exit 0 with empty stdout on every failure, because exit 2 (also a Go panic's exit code) means "block" to Claude Code and Codex.
 - **`mcp` and `hook` own stdout** (JSON-RPC, and hook output the agent reads with high authority). Log to stderr, and never hand `os.Stdout` to a child process.
 - **Validate what the relay supplies before a model or a shell sees it.**
@@ -48,6 +48,7 @@ CI runs vet, the race tests and `go build -trimpath` on Linux, macOS and Windows
 - **Nothing auto-approves because a peer asked.** Bridges decline every approval and permission request.
 - **Delivery.**
   - Pushes (deliverers, channel push, bridges) are at-least-once: they acknowledge only after hand-off.
+  - Once a push succeeds, acknowledge on a context the deliverer's shutdown can't cancel. `leave` and rebinding cancel it, sometimes right after the push, and a lost ack means the next join delivers the message again (`TestHandOffAcksWhenStopped`).
   - Pulls through `Agent.Inbox` (the `inbox` tool, `ask` waits, the CLI) acknowledge on read, a deliberate at-most-once.
   - Acks are a cumulative cursor, and `Agent.Fetch` returns each id only once per `Agent`. So hand off in seq order, keep unshown messages in `pending` (`requeue`), and call `remember` to record depths.
   - Sends are idempotent on (sender, id): a retry reuses its id.
@@ -77,15 +78,18 @@ CI runs vet, the race tests and `go build -trimpath` on Linux, macOS and Windows
   - Bindings are keyed by the Claude session id (`bindings/<id>.json`). `bindings/pid-<pid>.json` records the conversation each Claude Code process shows, because the MCP server keeps the session id it was spawned with.
   - Claude Code doesn't document the order of SessionStart and the MCP server's `initialize`, and `claude --continue` can hand the server the startup session id. At `initialize` the server keeps a pid record its own process wrote (newer than the process's inbox socket) and replaces only an earlier process's. It re-reads the binding before every tool call and, while it delivers live, every 2 s.
   - `join` carries `_meta["anthropic/requiresUserInteraction"]`: Claude Code asks the user for every join in every mode, and `dontAsk` refuses it. Background tests pre-join on the session's behalf (docs/live-testing.md).
+  - `threadsplice mcp` must be Claude Code's direct child: it takes the Claude Code pid from `os.Getppid()`, while hooks use `$CLAUDE_PID`. A wrapper in between (a script that doesn't `exec`, npx) splits its pid record from the hooks'. Put variables in the MCP config's `env` instead.
+  - Never prune `bindings/<session id>.json` by age: a binding is how `claude --resume` rejoins, however old the conversation. Only `pid-<pid>.json` records of dead processes are reclaimed.
   - SessionEnd(reason `clear`) fires before SessionStart(source `clear`). SessionEnd must keep the pid record, or `/clear` can't move the binding.
   - Session-member files live in `children/<parent alias>/`, outside `identities/`, so `List` and `Load("")` never see them. They are never overwritten: `SaveChild` writes the token before the relay call (pending, no participant id) and completes the file once. `DeleteChild` removes only a pending one.
 - **Fence the environment in tests**, as `internal/mcp`'s `TestMain` does: a temp `THREADSPLICE_HOME`, `THREADSPLICE_AS` empty, and `CLAUDE_CODE_MESSAGING_*`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`, `CLAUDE_PROJECT_DIR` and `CLAUDE_CODE_ENTRYPOINT` unset. Run from inside a Claude session, an unfenced test can post into that session, bind to it, or touch real identities.
 - **Codex.**
   - `-c mcp_servers={}` doesn't disable MCP servers. The bridge runs Codex under its own `CODEX_HOME`, which holds only a symlink to `auth.json`.
   - Peer text enters as `toolOutput`, which needs Codex ≥ 0.151. The bridge fails closed when Codex reports an older version or rejects the field.
+  - `maxWaitSeconds` (240) must stay under the `tool_timeout_sec = 300` that `setup codex` writes; Codex's documented default is 60 s, and a call it abandons loses the messages it already fetched.
 - **The relay's long-poll cap** (`maxWait`, 30 s) must stay under the client's 60 s HTTP timeout and under proxy read timeouts.
 - **`seq` is relay-wide,** so it has gaps within a room. Participants resume from their server-side `acked_seq`.
-- **Setup text** replaces every literal `NAME` with the alias, so keep that word out of the prose. `TestSetup` matches phrases that must not wrap across lines. Vendor config formats there follow the vendors' docs as of October 2026; re-check those docs before changing them. The UI's Connect view has its own copy of the session-mode hooks (`claudeHooks` in `internal/ui/room.go`): keep the two in step.
+- **Setup text** replaces every literal `NAME` with the alias, so keep that word out of the prose. `TestSetup` matches phrases that must not wrap across lines. Vendor config formats there follow the vendors' docs as of October 2026; re-check those docs before changing them. The UI's Connect view has its own copy of the session-mode hooks (`claudeHooks` in `internal/ui/room.go`), and its chat phrase (`joinPhrase`) repeats how `join` picks a membership (`client.MachineMemberships`): keep each pair in step.
 
 ## Conventions
 
@@ -94,6 +98,7 @@ CI runs vet, the race tests and `go build -trimpath` on Linux, macOS and Windows
 - **Tests fake the external agent.** The test binary re-runs itself as the fake (for example `-fake-acp-agent`), or the test uses `io.Pipe`. Tests never spend model tokens.
 - **Keep docs in step with the code.** Update the README Status table, and `docs/threat-model.md` when a boundary moves, in the same change.
 - **Naming.** Prose says "thread splice"; the binary and module say `threadsplice`.
+- **No `# comment` after a command people paste** (docs, setup text, CLI and installer output). zsh, macOS's default shell, passes the comment's words as arguments. Put the hint on its own line; in the UI, Copy skips `.cmt`.
 - **Never commit** `deploy/.env` or `*.db` files (both gitignored). The same goes for identity files and `.github/hooks/threadsplice.json`, which are not gitignored, so keep `THREADSPLICE_HOME` outside the repo.
 
 Live tests against a real Claude Code session spend model tokens; see [docs/live-testing.md](docs/live-testing.md).
