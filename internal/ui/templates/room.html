@@ -69,7 +69,7 @@
 {{- else}}
 {{- if eq .Kind "ask"}}<p class="tags"><span class="tag ask">Ask</span></p>{{end}}
 {{- if .ReplyTo}}<a class="quote" href="#m-{{.ReplyTo}}"><span class="re"><span aria-hidden="true">↩</span> reply to</span> {{with .Quote}}<span class="q">“{{.}}”</span>{{else}}<span class="q" data-quote><code>{{short $.ReplyTo}}</code></span>{{end}}</a>{{end}}
-{{- range blocks .Text}}{{if .Code}}<div class="snippet"><pre class="code">{{.Open}}<code>{{.Body}}</code>{{.Close}}</pre><button type="button" class="copy icon" data-copy aria-label="Copy code">{{template "i-copy"}}{{template "i-check"}}</button></div>{{else}}<div class="text">{{.Text}}</div>{{end}}{{end}}
+{{- template "md" .Text}}
 {{- end}}
 </div>
 {{- if or (eq .Kind "ask") (gt .Depth 0)}}
@@ -77,6 +77,18 @@
 {{- end}}
 </div>
 </li>{{end}}
+
+{{/* A message body as markdown (markdown.go): every value below is escaped by html/template; peer text never becomes markup. */}}
+{{define "md"}}{{range markdown .}}
+{{- if eq .Kind "code"}}<div class="snippet"><pre class="code">{{.Code.Open}}<code>{{.Code.Body}}</code>{{.Code.Close}}</pre><button type="button" class="copy icon" data-copy aria-label="Copy code">{{template "i-copy"}}{{template "i-check"}}</button></div>
+{{- else if eq .Kind "p"}}<p class="text">{{template "spans" .Spans}}</p>
+{{- else if eq .Kind "h"}}<p class="text md-h md-h{{.Level}}">{{template "spans" .Spans}}</p>
+{{- else if eq .Kind "list"}}<ul class="text md-list">{{range .Items}}<li class="md-d{{.Depth}}{{if .Num}} md-num{{end}}">{{with .Num}}<span class="md-n">{{.}}</span>{{end}}{{template "spans" .Spans}}</li>{{end}}</ul>
+{{- else if eq .Kind "quote"}}<blockquote class="text md-quote">{{template "spans" .Spans}}</blockquote>
+{{- else if eq .Kind "hr"}}<hr class="md-hr">
+{{- else if eq .Kind "table"}}<div class="md-table"><table><thead><tr>{{range .Head}}<th>{{template "spans" .}}</th>{{end}}</tr></thead><tbody>{{range .Rows}}<tr>{{range .}}<td>{{template "spans" .}}</td>{{end}}</tr>{{end}}</tbody></table></div>
+{{- end}}{{end}}{{end}}
+{{define "spans"}}{{range .}}{{if eq .Kind "code"}}<code>{{.Text}}</code>{{else if eq .Kind "b"}}<strong>{{template "spans" .Kids}}</strong>{{else if eq .Kind "i"}}<em>{{template "spans" .Kids}}</em>{{else if eq .Kind "s"}}<del>{{template "spans" .Kids}}</del>{{else if eq .Kind "a"}}<a href="{{.URL}}" target="_blank" rel="noopener noreferrer nofollow">{{template "spans" .Kids}}</a>{{else}}{{.Text}}{{end}}{{end}}{{end}}
 
 {{define "poller"}}<div id="poller"{{if not .Gone}} hx-get="/r/{{.Room.Alias}}/feed?after={{.Last}}" hx-trigger="every 2s, ts-sent from:body" hx-swap="outerHTML"{{end}}></div>{{end}}
 

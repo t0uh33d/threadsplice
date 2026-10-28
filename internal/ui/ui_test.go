@@ -620,8 +620,8 @@ func TestWatching(t *testing.T) {
 		t.Fatal(err)
 	}
 	must(t, e.hx(http.MethodGet, "/r/carol/feed?after=1", nil), http.StatusOK,
-		"<div class=\"text\">Patch:\n</div><div class=\"snippet\"><pre class=\"code\">```go\n<code>if a &lt; b {\n\treturn &#34;&lt;b&gt;&#34;\n}\n</code>```\n</pre>",
-		`data-copy aria-label="Copy code"`, "<div class=\"text\">That&#39;s all.</div>")
+		"<p class=\"text\">Patch:</p><div class=\"snippet\"><pre class=\"code\">```go\n<code>if a &lt; b {\n\treturn &#34;&lt;b&gt;&#34;\n}\n</code>```\n</pre>",
+		`data-copy aria-label="Copy code"`, "<p class=\"text\">That&#39;s all.</p>")
 
 	// Who can be written to, for the compose form; ids on remove buttons, so
 	// keyboard focus survives the panel's refresh.
@@ -933,6 +933,68 @@ func TestBlocks(t *testing.T) {
 		b := block{in, true}
 		if got := [3]string{b.Open(), b.Body(), b.Close()}; got != want || got[0]+got[1]+got[2] != in {
 			t.Errorf("parts(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestMarkdown renders message text through the bubble template: each
+// construct becomes the markup it should, text stays text, and only absolute
+// http(s) URLs become links.
+func TestMarkdown(t *testing.T) {
+	render := func(text string) string {
+		var b strings.Builder
+		if err := pages["room"].ExecuteTemplate(&b, "md", text); err != nil {
+			t.Fatal(err)
+		}
+		return b.String()
+	}
+	const a = `" target="_blank" rel="noopener noreferrer nofollow">`
+	for in, want := range map[string]string{
+		"plain\n  indented":                       "<p class=\"text\">plain\n  indented</p>",
+		"## Status #":                             `<p class="text md-h md-h2">Status</p>`,
+		"**b** *i* _i_ ~~s~~ `c` \\*not*":         `<p class="text"><strong>b</strong> <em>i</em> <em>i</em> <del>s</del> <code>c</code> *not*</p>`,
+		"user_id and file_name":                   `<p class="text">user_id and file_name</p>`,
+		"- a\n  - b\n    more\n1. one\n2) two":    `<ul class="text md-list"><li class="md-d0">a</li><li class="md-d1">b` + "\n" + `more</li><li class="md-d0 md-num"><span class="md-n">1.</span>one</li><li class="md-d0 md-num"><span class="md-n">2)</span>two</li></ul>`,
+		"> said\n> twice":                         `<blockquote class="text md-quote">said` + "\n" + `twice</blockquote>`,
+		"a\n\n***\nb":                             `<p class="text">a</p><hr class="md-hr"><p class="text">b</p>`,
+		"| h | **k** |\n|:--|--:|\n| 1 | a\\|b |": `<div class="md-table"><table><thead><tr><th>h</th><th><strong>k</strong></th></tr></thead><tbody><tr><td>1</td><td>a|b</td></tr></tbody></table></div>`,
+		"[docs](https://e.example/x?a=1&b=2)":     `<a href="https://e.example/x?a=1&amp;b=2` + a + `docs</a>`,
+		"see (https://e.example/a_(b)), ok":       `see (<a href="https://e.example/a_%28b%29` + a + `https://e.example/a_(b)</a>), ok`,
+		"[**bold** link](http://e.example)":       `<a href="http://e.example` + a + `<strong>bold</strong> link</a>`,
+		"[no](ftp://e.example) [no](/local)":      `[no](ftp://e.example) [no](/local)`,
+		"<b>x</b> &amp;":                          `&lt;b&gt;x&lt;/b&gt; &amp;amp;`,
+		"```go\nx := `y`\n```":                    `<pre class="code">` + "```go\n<code>x := `y`\n</code>```</pre>",
+	} {
+		if got := render(in); !strings.Contains(got, want) {
+			t.Errorf("markdown %q:\n got %s\nwant %s", in, got, want)
+		}
+	}
+	if q := quote("## **Plan**: ship\n- a"); q != "Plan: ship" {
+		t.Errorf("quote of markdown = %q, want it without markup", q)
+	}
+}
+
+// TestMarkdownLinear: a message may hold up to 96 KiB of a hostile peer's
+// text; unclosed markers, brackets and URLs must not make rendering slow.
+func TestMarkdownLinear(t *testing.T) {
+	const n = 96 << 10
+	for name, in := range map[string]string{
+		"stars":    strings.Repeat("*", n),
+		"bold":     strings.Repeat("**a ", n/4),
+		"under":    strings.Repeat("_a", n/2),
+		"brackets": strings.Repeat("[", n-3) + "](x",
+		"links":    strings.Repeat("[a](", n/4),
+		"ticks":    strings.Repeat("`a", n/2),
+		"runs":     strings.Repeat("``a`", n/4),
+		"urls":     strings.Repeat("(http://a", n/9),
+		"nested":   strings.Repeat("**_~~[", n/6),
+		"items":    strings.Repeat("- *a\n", n/5),
+		"pipes":    "| a |\n|---|\n" + strings.Repeat("|", n),
+	} {
+		start := time.Now()
+		markdown(in)
+		if d := time.Since(start); d > 2*time.Second {
+			t.Errorf("%s: rendering 96 KiB took %v", name, d)
 		}
 	}
 }

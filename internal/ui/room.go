@@ -239,16 +239,13 @@ func link(rows []row) {
 }
 
 // quote is the start of what a reply answers: the asked message's first
-// block, a code block without its fences, as ui.js quotes rows that arrive later.
+// block as text, without markdown or code fences, as ui.js quotes rows that
+// arrive later.
 func quote(text string) string {
-	bs := blocks(text)
-	switch {
-	case len(bs) == 0:
-		return ""
-	case bs[0].Code:
-		return snippet(bs[0].Body())
+	if bs := markdown(text); len(bs) > 0 {
+		return snippet(plainText(bs[0]))
 	}
-	return snippet(bs[0].Text)
+	return ""
 }
 
 // annotate adds what the member list knows about each sender: whether it is

@@ -421,6 +421,8 @@ func hostileRelay(t *testing.T, key e2ee.Key, room string) *httptest.Server {
 			{Seq: 5, ID: "K1", From: "KID1", Sealed: seal("KID1", "", "K1", api.Payload{Kind: api.KindReply, Text: "from a real session", ReplyTo: "feed"}), CreatedAt: now},
 			{Seq: 6, ID: "K3", From: "KID3", Sealed: seal("KID3", "", "K3", api.Payload{Kind: api.KindMessage, Text: "from a fake session"}), CreatedAt: now},
 			{Seq: 7, ID: "K4", From: "KID4", Sealed: seal("KID4", "", "K4", api.Payload{Kind: api.KindMessage, Text: "from a misnamed session"}), CreatedAt: now},
+			// Markdown from a peer: every construct renders, nothing becomes markup the templates don't write.
+			{Seq: 8, ID: "MD1", From: "ME", Sealed: seal("ME", "", "MD1", api.Payload{Kind: api.KindMessage, Text: hostileMarkdown}), CreatedAt: now},
 		}})
 	})
 	mux.HandleFunc("POST /v1/rooms/{room}/messages", fail)
@@ -480,7 +482,8 @@ var htmxValue = map[string]*regexp.Regexp{
 	"hx-post":    regexp.MustCompile(`^/r/[A-Za-z0-9._-]+/(send|invite|revoke)$`),
 	"hx-trigger": regexp.MustCompile(`^(every 2s, ts-sent from:body|every 5s|every 3s)$`),
 	"src":        regexp.MustCompile(`^/static/(htmx-2\.0\.11\.min|ui)\.js$`),
-	"href":       regexp.MustCompile(`^(/[^:]*|#[A-Za-z][A-Za-z0-9_-]*|https://github\.com/t0uh33d/threadsplice/[A-Za-z0-9/._-]*)$`),
+	// Peers' markdown links are absolute http(s) URLs (markdown.go linkable); anything else is ours.
+	"href": regexp.MustCompile(`^(/[^:]*|#[A-Za-z][A-Za-z0-9_-]*|https://github\.com/t0uh33d/threadsplice/[A-Za-z0-9/._-]*|https?://[^\s"'<>` + "`" + `\\]+)$`),
 	// ui.js looks these up by id or compares them; they carry relay ids only after validation.
 	"data-dialog": regexp.MustCompile(`^rm-[A-Za-z0-9_-]{1,64}$`),
 	"data-re":     regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`),
@@ -513,6 +516,15 @@ func inert(t *testing.T, what, body string) {
 	}
 }
 
+// hostileMarkdown is a peer message using every markdown construct the
+// bubbles render, each wrapped around markup or a URL that must stay inert.
+const hostileMarkdown = "# <script>alert(1)</script>\n" +
+	"**<img src=x onerror=alert(1)>** _<b>it</b>_ ~~<i>x</i>~~ `<b hx-get=/x>`\n" +
+	"[js](javascript:alert(1)) [data](data:text/html,<b>) [rel](/r/alice) [quote](https://e.example/\"onmouseover=\"x) " +
+	"![img](https://e.example/p.png) [ok](https://e.example/a?b=1&c=<d>) https://e.example/bare_url.\n" +
+	"- <a href=x>item</a>\n  1. <svg onload=x>\n> <iframe src=x>\n\n---\n" +
+	"| <th>a</th> | b |\n|---|---|\n| [x](https://e.example/t) | <td onclick=x> |"
+
 // TestHostileRelay renders everything a misbehaving relay controls and checks
 // it stays inert, that sender labels and ids are not taken as-is, and that
 // tokens it echoes back are not shown.
@@ -536,6 +548,12 @@ func TestHostileRelay(t *testing.T) {
 	must(t, page, http.StatusOK, "decrypts fine", "spoofed sender", "Couldn't decrypt this message", "id collision", `id="m-OK1"`, `id="m-feed"`)
 	mustNot(t, page, "alice (you)", `id="m-X1`, `id="m-"`)
 	feed := check("feed", e.hx(http.MethodGet, "/r/alice/feed?after=0", nil))
+	must(t, feed, http.StatusOK, `<p class="text md-h md-h1">&lt;script&gt;alert(1)&lt;/script&gt;</p>`,
+		`<strong>&lt;img src=x onerror=alert(1)&gt;</strong>`, `<code>&lt;b hx-get=/x&gt;</code>`,
+		`[js](javascript:alert(1))`, `!<a href="https://e.example/p.png" target="_blank" rel="noopener noreferrer nofollow">img</a>`,
+		`<a href="https://e.example/bare_url" target="_blank" rel="noopener noreferrer nofollow">https://e.example/bare_url</a>.`,
+		`<th>&lt;th&gt;a&lt;/th&gt;</th>`, `<td>&lt;td onclick=x&gt;</td>`)
+	mustNot(t, feed, `href="javascript`, `href="data`, `href="/r/alice"`, `<img`, `onmouseover="x`)
 	must(t, feed, http.StatusOK, "unknown", `class="msg k-message"`, "depth 3",
 		`id="m-feed" class="msg k-ask mine answered"`, "“id collision”", `<span class="on">on alice</span>`)
 	if strings.Contains(feed.body, `href="#m-X1`) {

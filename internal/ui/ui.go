@@ -272,7 +272,7 @@ func (s *server) badForm(w http.ResponseWriter, r *http.Request, err error) {
 
 // ---- rendering ----
 
-var funcs = template.FuncMap{"short": short, "ago": ago, "clock": clock, "kind": kindClass, "blocks": blocks, "agentName": agentName}
+var funcs = template.FuncMap{"short": short, "ago": ago, "clock": clock, "kind": kindClass, "markdown": markdown, "agentName": agentName}
 
 // pages holds one template set per page; each defines "main" for the layout.
 // room's also holds the fragments htmx swaps in, and the room's other pages

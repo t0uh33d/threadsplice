@@ -309,6 +309,26 @@ input[readonly] { background: var(--fill); }
 .mine.k-ask .bubble { box-shadow: inset -3px 0 0 var(--ask); }
 .msg:target .bubble { outline: 2px solid var(--reply); outline-offset: 2px; }
 .text { white-space: pre-wrap; tab-size: 4; }
+/* Markdown in a bubble (markdown.go): chat-sized, not document-sized. */
+.bubble > * + :is(.text, .md-table, .snippet) { margin-top: 6px; }
+.md-h { font-weight: 700; }
+.md-h1 { font-size: 1.125rem; }
+.md-h2 { font-size: 1.0625rem; }
+.md-list { padding-left: 1.25em; white-space: normal; }
+.md-list li { white-space: pre-wrap; }
+.md-d1 { margin-left: 1.25em; }
+.md-d2 { margin-left: 2.5em; }
+.md-d3 { margin-left: 3.75em; }
+.md-num { list-style: none; }
+.md-n { display: inline-block; min-width: 1.25em; margin-left: -1.25em; padding-right: 0.3em; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.md-quote { margin: 0; padding-left: 10px; border-left: 3px solid var(--fill-2); color: var(--text-2); }
+.md-hr { margin: 8px 0; border: 0; border-top: 1px solid var(--fill-2); }
+.md-table { overflow-x: auto; }
+.md-table table { border-collapse: collapse; font-size: 0.875rem; }
+.md-table th, .md-table td { padding: 3px 8px; border: 1px solid var(--fill-2); text-align: left; vertical-align: top; white-space: pre-wrap; }
+.md-table th { font-weight: 600; }
+.bubble .text code, .md-table code { white-space: pre-wrap; }
+.bubble del { color: var(--text-2); }
 .tags { display: flex; gap: 6px; margin-bottom: 6px; }
 .tag {
   display: inline-flex; align-items: center; padding: 1px 8px; border-radius: 6px;
