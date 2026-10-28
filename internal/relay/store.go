@@ -54,7 +54,7 @@ func (c clash) Error() string {
 const maxChildren = 32
 
 // schemaVersion is the user_version of a current database.
-const schemaVersion = 2
+const schemaVersion = 3
 
 // Composite foreign keys on (room_id, participant) make cross-room references
 // impossible at the database level, not just in handler code.
@@ -99,8 +99,8 @@ CREATE TABLE messages (
 	FOREIGN KEY (room_id, recipient_id) REFERENCES participants (room_id, id) ON DELETE CASCADE
 );
 CREATE INDEX messages_room_seq ON messages (room_id, seq);
-` + schemaV2 + `
-PRAGMA user_version = 2;
+` + schemaV2 + schemaV3 + `
+PRAGMA user_version = 3;
 `
 
 // schemaV2 adds session members: participants a machine membership creates
@@ -120,6 +120,12 @@ CREATE TRIGGER children_one_level BEFORE INSERT ON children
 WHEN EXISTS (SELECT 1 FROM children WHERE child_id = NEW.parent_id)
 	OR EXISTS (SELECT 1 FROM children WHERE parent_id = NEW.child_id)
 BEGIN SELECT RAISE(ABORT, 'session members are one level deep'); END;
+`
+
+// schemaV3 lets an invite admit more than one join. used_at is set when the
+// last one is taken; an older invite admits exactly one, as before.
+const schemaV3 = `
+ALTER TABLE invites ADD COLUMN uses_left INTEGER NOT NULL DEFAULT 1;
 `
 
 type store struct{ db *sql.DB }
@@ -147,7 +153,9 @@ func openStore(path string) (*store, error) {
 	case 0:
 		ddl = schema
 	case 1:
-		ddl = schemaV2 + "PRAGMA user_version = 2;"
+		ddl = schemaV2 + schemaV3 + "PRAGMA user_version = 3;"
+	case 2:
+		ddl = schemaV3 + "PRAGMA user_version = 3;"
 	case schemaVersion:
 	default:
 		db.Close()
@@ -193,14 +201,14 @@ func (s *store) createRoom(ctx context.Context, name, owner string, tokenHash []
 	return roomID, pid, err
 }
 
-func (s *store) createInvite(ctx context.Context, roomID, by string, tokenHash []byte, expires time.Time) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO invites (token_hash, room_id, created_by, expires_at) VALUES (?, ?, ?, ?)`,
-		tokenHash, roomID, by, ms(expires))
+func (s *store) createInvite(ctx context.Context, roomID, by string, tokenHash []byte, expires time.Time, uses int) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO invites (token_hash, room_id, created_by, expires_at, uses_left) VALUES (?, ?, ?, ?, ?)`,
+		tokenHash, roomID, by, ms(expires), uses)
 	return err
 }
 
-// join redeems a single-use invite and creates the participant atomically. A
-// name clash rolls back, so the invite stays usable.
+// join redeems one use of an invite and creates the participant atomically. A
+// name clash rolls back, so the use isn't spent.
 func (s *store) join(ctx context.Context, inviteHash []byte, name string, tokenHash []byte) (api.Membership, error) {
 	m := api.Membership{ParticipantID: rand.Text()}
 	now := ms(time.Now())
@@ -241,7 +249,9 @@ func (s *store) join(ctx context.Context, inviteHash []byte, name string, tokenH
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE invites SET used_at = ? WHERE token_hash = ?`, now, inviteHash); err != nil {
+		// The right-hand side reads uses_left before this update.
+		if _, err := tx.ExecContext(ctx, `UPDATE invites SET uses_left = uses_left - 1,
+			used_at = CASE WHEN uses_left <= 1 THEN ? END WHERE token_hash = ?`, now, inviteHash); err != nil {
 			return err
 		}
 		// A newcomer starts at the room's current cursor: retained history is

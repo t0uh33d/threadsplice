@@ -37,7 +37,7 @@ func pair(t *testing.T) (alice, bob *client.Agent) {
 	}
 	key := e2ee.NewKey().String()
 	alice, _ = client.NewAgent(client.Identity{Alias: "alice", Relay: ts.URL, RoomID: m.RoomID, RoomName: "proj", ParticipantID: m.ParticipantID, Name: "alice", Owner: true, Token: m.Token, RoomKey: key})
-	inv, err := alice.Relay.CreateInvite(ctx, m.RoomID, time.Hour)
+	inv, err := alice.Relay.CreateInvite(ctx, m.RoomID, time.Hour, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,6 +47,26 @@ func pair(t *testing.T) (alice, bob *client.Agent) {
 	}
 	bob, _ = client.NewAgent(client.Identity{Alias: "bob", Relay: ts.URL, RoomID: j.RoomID, RoomName: "proj", ParticipantID: j.ParticipantID, Name: "bob", Token: j.Token, RoomKey: key})
 	return alice, bob
+}
+
+// joinRoom adds a member called name to owner's room.
+func joinRoom(t *testing.T, owner *client.Agent, name string) *client.Agent {
+	t.Helper()
+	ctx := context.Background()
+	inv, err := owner.Relay.CreateInvite(ctx, owner.ID.RoomID, time.Hour, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err := client.New(owner.ID.Relay, "").Join(ctx, inv.Token, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := client.NewAgent(client.Identity{Alias: name, Relay: owner.ID.Relay, RoomID: j.RoomID, RoomName: owner.ID.RoomName,
+		ParticipantID: j.ParticipantID, Name: name, Token: j.Token, RoomKey: owner.ID.RoomKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
 }
 
 type session struct {
@@ -166,6 +186,50 @@ func toolText(t *testing.T, resp map[string]any) string {
 		t.Fatalf("tool error: %v", res)
 	}
 	return res["content"].([]any)[0].(map[string]any)["text"].(string)
+}
+
+// An orchestrator hands several agents one task: each gets a direct copy,
+// and ask (without live delivery) waits for every reply. A misspelt name
+// sends nothing.
+func TestAskSeveral(t *testing.T) {
+	ctx := context.Background()
+	alice, bob := pair(t)
+	carol := joinRoom(t, alice, "carol")
+	s := start(t, alice, "hold")
+	s.call("initialize", map[string]any{"protocolVersion": "2025-06-18"})
+	answer := func(a *client.Agent, text string) {
+		msgs, _ := a.Inbox(ctx, 10*time.Second)
+		if len(msgs) == 1 && msgs[0].Direct && msgs[0].Kind == api.KindAsk {
+			a.Send(ctx, "alice", api.Payload{Kind: api.KindReply, ReplyTo: msgs[0].ID, Text: text})
+		}
+	}
+
+	go answer(bob, "bob: LGTM")
+	go answer(carol, "carol: one nit")
+	out := s.tool("ask", map[string]any{"to": "bob, carol,bob", "text": "review?", "wait_seconds": 10})
+	if !strings.Contains(out, "bob: LGTM") || !strings.Contains(out, "carol: one nit") || strings.Contains(out, "No reply") || strings.Count(out, "(id ") != 2 {
+		t.Fatalf("ask two: %s", out)
+	}
+	if out := s.toolErr("ask", map[string]any{"to": "bob,carl", "text": "typo"}); !strings.Contains(out, `"carl"`) {
+		t.Fatalf("ask with a misspelt name: %s", out)
+	}
+	go answer(bob, "bob again")
+	out = s.tool("ask", map[string]any{"to": "bob,carol", "text": "still there?", "wait_seconds": 2})
+	if !strings.Contains(out, "bob again") || !strings.Contains(out, `No reply within 2s from "carol"`) {
+		t.Fatalf("ask with a reply missing: %s", out)
+	}
+	if msgs, err := carol.Inbox(ctx, 0); err != nil || len(msgs) != 1 || msgs[0].Text != "still there?" {
+		t.Fatalf("carol's inbox (the misspelt ask must not be in it): %+v, %v", msgs, err)
+	}
+	out = s.tool("send", map[string]any{"to": "bob,carol", "text": "thanks both"})
+	if !strings.HasPrefix(out, `sent to "bob" (id `) || !strings.Contains(out, `, "carol" (id `) {
+		t.Fatalf("send to two: %s", out)
+	}
+	for _, a := range []*client.Agent{bob, carol} {
+		if msgs, err := a.Inbox(ctx, 5*time.Second); err != nil || len(msgs) != 1 || msgs[0].Text != "thanks both" || !msgs[0].Direct {
+			t.Fatalf("%s's copy: %+v, %v", a.ID.Name, msgs, err)
+		}
+	}
 }
 
 func TestChannelSession(t *testing.T) {

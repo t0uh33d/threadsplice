@@ -17,6 +17,7 @@ thread splice connects agent sessions you already have open: a small relay you h
 - **Your own sessions, live.** Messages land in the session you're already using. An idle Claude Code session starts working on a message by itself; Codex queues it as the next turn. Delivery uses only documented interfaces, never keystrokes typed into a terminal.
 - **Self-hosted, outbound-only.** One Go binary plus SQLite on your server. Agent machines only make outbound HTTPS connections.
 - **Peers are untrusted input.** Every message is framed as coming from another agent, not from you. Nothing is ever auto-approved because a peer asked.
+- **Groups, not just pairs.** A room holds any number of agents on laptops, VMs, containers or pods. Ask one agent or several at once and collect every answer: an orchestrator handing out work, a CI step asking for a review, or agents working a problem out together. See [docs/orchestration.md](docs/orchestration.md).
 
 Other tools exist for cross-machine agent messaging, but each gives up something here: a shared group key, typing into terminals, public brokers, or Claude-only. See [docs/landscape.md](docs/landscape.md).
 
@@ -58,7 +59,7 @@ The UI is reachable only from this machine, and only via the link it prints. Tha
              (MCP server + hooks)       SQLite, long-poll        (MCP server + hooks, or a bridge)
 ```
 
-A room's members are machines and the agent sessions on them. The owner's machine creates the room, generates the room key, and prints a single-use invite (`<relay>#<invite token>.<room key>`) to share privately. Each other machine joins once with an invite. The relay redeems the token and never sees the key.
+A room's members are machines and the agent sessions on them. The owner's machine creates the room, generates the room key, and prints an invite (`<relay>#<invite token>.<room key>`) to share privately. An invite is single-use unless the owner asks for more, as `invite -uses 20` does for a fleet of containers. Each other machine joins once with an invite. The relay redeems the token and never sees the key.
 
 On each machine, the agent runs `threadsplice mcp` as an MCP server. That gives the agent its tools, and it delivers incoming messages into the live session. Lifecycle hooks register the session, report busy or idle, and nudge the agent about waiting messages.
 
@@ -163,6 +164,7 @@ threadsplice bridge codex -as codex-bot -cwd ~/src/myproject
 | Live delivery via `codex queue`; Claude channels (opt-in) | Implemented; real-agent verification under way |
 | Bridges: Codex app-server, Agent Client Protocol | Implemented; real-agent verification under way |
 | Local web UI (`threadsplice ui`) | Works; tested, security-reviewed, and driven in a real browser |
+| Groups: `send` and `ask` to several members, `threadsplice ask` for scripts, fleet invites (`invite -uses`, relay schema v3) | Works; integration-tested. Not yet run with real agents in containers |
 | Copilot Chat idle wake (Agent Host Protocol) | Planned |
 | Binary releases (`release.yml`) and `install.sh` | **v0.1.0 published** by the workflow: six platforms, SHA256SUMS and a build attestation. The one-line installer was run against it on macOS (arm64); the attestation check needs `gh` and wasn't run there |
 | Docker Compose deployment | Written; not yet verified |

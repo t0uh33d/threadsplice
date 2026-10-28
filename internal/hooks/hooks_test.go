@@ -53,7 +53,7 @@ func room(t *testing.T) *client.Agent {
 	if err := client.Save(alice); err != nil {
 		t.Fatal(err)
 	}
-	inv, err := client.New(ts.URL, m.Token).CreateInvite(ctx, m.RoomID, time.Hour)
+	inv, err := client.New(ts.URL, m.Token).CreateInvite(ctx, m.RoomID, time.Hour, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

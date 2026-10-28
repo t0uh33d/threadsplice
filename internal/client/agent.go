@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -128,22 +129,39 @@ func (a *Agent) firstSighting(id string) bool {
 	return true
 }
 
-// resolve maps a participant name (or id) to its id.
-func (a *Agent) resolve(ctx context.Context, to string) (string, error) {
+// resolve maps participant names (or ids) to ids, with one lookup for all.
+func (a *Agent) resolve(ctx context.Context, to ...string) ([]string, error) {
 	ps, err := a.Peers(ctx)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	var names []string
-	for _, p := range ps {
-		if (p.Name == to || p.ID == to) && !p.Revoked {
-			return p.ID, nil
+	ids := make([]string, 0, len(to))
+	for _, t := range to {
+		i := slices.IndexFunc(ps, func(p api.Participant) bool { return (p.Name == t || p.ID == t) && !p.Revoked })
+		if i < 0 {
+			var names []string
+			for _, p := range ps {
+				if p.ID != a.ID.ParticipantID && !p.Revoked {
+					names = append(names, p.Name)
+				}
+			}
+			return nil, fmt.Errorf("no active participant %q in room %q (participants: %s)", t, a.ID.RoomName, strings.Join(names, ", "))
 		}
-		if p.ID != a.ID.ParticipantID && !p.Revoked {
-			names = append(names, p.Name)
+		ids = append(ids, ps[i].ID)
+	}
+	return ids, nil
+}
+
+// Recipients splits a comma-separated list of participant names, dropping
+// blanks and repeats. Names can't contain commas (api.NameRule).
+func Recipients(to string) []string {
+	var out []string
+	for _, n := range strings.Split(to, ",") {
+		if n = strings.TrimSpace(n); n != "" && !slices.Contains(out, n) {
+			out = append(out, n)
 		}
 	}
-	return "", fmt.Errorf("no active participant %q in room %q (participants: %s)", to, a.ID.RoomName, strings.Join(names, ", "))
+	return out
 }
 
 // Send seals p and sends it to the participant named `to`, or to the whole
@@ -157,18 +175,43 @@ func (a *Agent) Send(ctx context.Context, to string, p api.Payload) (string, err
 func (a *Agent) SendID(ctx context.Context, id, to string, p api.Payload) (string, error) {
 	toID := ""
 	if to != "" {
-		var err error
-		if toID, err = a.resolve(ctx, to); err != nil {
+		ids, err := a.resolve(ctx, to)
+		if err != nil {
 			return "", err
 		}
+		toID = ids[0]
 	}
+	return id, a.sendTo(ctx, id, toID, p)
+}
+
+// SendEach sends p to each participant in `to` as a direct message of its own,
+// so an orchestrator can hand several agents the same task. Every name is
+// checked first, so a typo sends nothing. It returns the ids sent, in order;
+// after a failure part way, those that went out before it.
+func (a *Agent) SendEach(ctx context.Context, to []string, p api.Payload) ([]string, error) {
+	toIDs, err := a.resolve(ctx, to...)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(to))
+	for _, t := range toIDs {
+		id := rand.Text()
+		if err := a.sendTo(ctx, id, t, p); err != nil {
+			return ids, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func (a *Agent) sendTo(ctx context.Context, id, toID string, p api.Payload) error {
 	pt, err := json.Marshal(p)
 	if err != nil {
-		return "", err
+		return err
 	}
 	sealed := a.key.Seal(e2ee.Header{Room: a.ID.RoomID, From: a.ID.ParticipantID, To: toID, ID: id}, pt)
 	_, err = a.Relay.Send(ctx, a.ID.RoomID, api.SendRequest{ID: id, To: toID, Sealed: sealed})
-	return id, err
+	return err
 }
 
 // Fetch returns readable messages after seq `after` (after < 0: after this

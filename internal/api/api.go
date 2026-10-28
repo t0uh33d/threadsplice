@@ -27,14 +27,18 @@ type Membership struct {
 	Token         string `json:"token"`
 }
 
-// CreateInviteRequest asks for a single-use invite token. Owner only.
+// CreateInviteRequest asks for an invite token. Owner only.
 type CreateInviteRequest struct {
 	TTLSeconds int `json:"ttl_seconds,omitempty"` // default 24h, max 7 days
+	// Uses is how many joins the invite admits: default 1, max 100, for a
+	// fleet of agents (containers, pods) that join with one secret. Relays
+	// before schema v3 refuse the field, so send it only above 1.
+	Uses int `json:"uses,omitempty"`
 }
 
-// Invite is a single-use, expiring invite token. It grants room membership but
-// does NOT contain the room key: clients append the key to the invite string
-// locally, so the relay never sees it.
+// Invite is an expiring invite token, single-use unless created with Uses. It
+// grants room membership but does NOT contain the room key: clients append the
+// key to the invite string locally, so the relay never sees it.
 type Invite struct {
 	Token     string    `json:"token"`
 	ExpiresAt time.Time `json:"expires_at"`

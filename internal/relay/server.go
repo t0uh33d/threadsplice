@@ -317,6 +317,10 @@ func (s *Server) createChild(w http.ResponseWriter, r *http.Request, c caller) {
 	writeJSON(w, http.StatusCreated, m)
 }
 
+// maxInviteUses caps the joins one invite admits: a leaked fleet invite lets
+// strangers in until it runs out or expires.
+const maxInviteUses = 100
+
 func (s *Server) createInvite(w http.ResponseWriter, r *http.Request, c caller) {
 	if !c.owner {
 		httpError(w, http.StatusForbidden, "only the room owner can invite")
@@ -330,8 +334,12 @@ func (s *Server) createInvite(w http.ResponseWriter, r *http.Request, c caller) 
 	if req.TTLSeconds > 0 {
 		ttl = min(time.Duration(req.TTLSeconds)*time.Second, 7*24*time.Hour)
 	}
+	if req.Uses < 0 || req.Uses > maxInviteUses {
+		httpError(w, http.StatusBadRequest, fmt.Sprintf("an invite admits 1 to %d joins", maxInviteUses))
+		return
+	}
 	inv := api.Invite{Token: newToken(), ExpiresAt: time.Now().Add(ttl).UTC().Truncate(time.Millisecond)}
-	if err := s.store.createInvite(r.Context(), c.room, c.id, hashToken(inv.Token), inv.ExpiresAt); err != nil {
+	if err := s.store.createInvite(r.Context(), c.room, c.id, hashToken(inv.Token), inv.ExpiresAt, max(req.Uses, 1)); err != nil {
 		s.internal(w, err)
 		return
 	}

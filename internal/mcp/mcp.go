@@ -381,24 +381,24 @@ const maxWaitSeconds = 240
 var toolDefs = []map[string]any{
 	{
 		"name":        "send",
-		"description": "Send an end-to-end encrypted message to another AI agent in your thread splice room, or to the whole room. Use kind=ask when you need an answer and kind=reply with reply_to=<id> when answering. Returns the message id.",
+		"description": "Send an end-to-end encrypted message to other AI agents in your thread splice room: one, several, or the whole room. Use kind=ask when you need an answer and kind=reply with reply_to=<id> when answering. Returns the message ids.",
 		"annotations": sends,
 		"inputSchema": schema(map[string]any{
 			"text":     prop("string", "Message text; include any code inline (peers can't see your files). Max ~96 KB."),
-			"to":       prop("string", "Recipient's participant name (see peers). Omit to message the whole room."),
+			"to":       prop("string", "Recipient's participant name (see peers), or several separated by commas: each gets its own copy. Omit to message the whole room."),
 			"kind":     map[string]any{"type": "string", "enum": []string{api.KindMessage, api.KindAsk, api.KindReply}, "description": "message (default), ask (you expect a reply) or reply."},
 			"reply_to": prop("string", "Id of the message you are answering."),
 		}, "text"),
 	},
 	{
 		"name":        "ask",
-		"description": "Ask another agent in your thread splice room a question. When this session receives messages automatically, it returns at once and the reply arrives later as a message; otherwise it waits up to wait_seconds and returns the reply plus anything else that arrived meanwhile (a later reply shows up in inbox).",
+		"description": "Ask one or more agents in your thread splice room a question; each gets its own copy. When this session receives messages automatically, it returns at once and the replies arrive later as messages; otherwise it waits up to wait_seconds for every reply and returns them plus anything else that arrived meanwhile (later replies show up in inbox).",
 		"annotations": sends,
 		"inputSchema": schema(map[string]any{
-			"to":           prop("string", "Recipient's participant name."),
+			"to":           prop("string", "Recipient's participant name, or several separated by commas (to hand the same task to several agents, say)."),
 			"text":         prop("string", "The question, with all context the peer needs."),
 			"reply_to":     prop("string", "For a follow-up question: id of the message it follows up on (keeps automatic exchanges bounded)."),
-			"wait_seconds": map[string]any{"type": "integer", "minimum": 0, "maximum": maxWaitSeconds, "description": "How long to wait for the reply when messages aren't delivered automatically (default 45)."},
+			"wait_seconds": map[string]any{"type": "integer", "minimum": 0, "maximum": maxWaitSeconds, "description": "How long to wait for the replies when messages aren't delivered automatically (default 45)."},
 		}, "to", "text"),
 	},
 	{
@@ -492,29 +492,31 @@ func (s *server) tool(ctx context.Context, m *member, name string, args toolArgs
 		if args.Kind != api.KindMessage && args.Kind != api.KindAsk && args.Kind != api.KindReply {
 			return "", fmt.Errorf("kind must be message, ask or reply")
 		}
-		id, err := s.sendMsg(ctx, m, args.To, api.Payload{Kind: args.Kind, Text: args.Text, ReplyTo: args.ReplyTo})
+		names := client.Recipients(args.To)
+		ids, err := s.sendMsg(ctx, m, names, api.Payload{Kind: args.Kind, Text: args.Text, ReplyTo: args.ReplyTo})
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("sent (id %s) to %s", id, recipient(args.To)), nil
+		return "sent to " + sent(names, ids), nil
 	case "ask":
-		if args.To == "" {
-			return "", fmt.Errorf("ask needs a recipient (to)")
+		names := client.Recipients(args.To)
+		if len(names) == 0 {
+			return "", fmt.Errorf("ask needs a recipient (to); to ask the whole room, use send with kind=ask and read the replies with inbox")
 		}
-		id, err := s.sendMsg(ctx, m, args.To, api.Payload{Kind: api.KindAsk, Text: args.Text, ReplyTo: args.ReplyTo})
+		ids, err := s.sendMsg(ctx, m, names, api.Payload{Kind: api.KindAsk, Text: args.Text, ReplyTo: args.ReplyTo})
 		if err != nil {
 			return "", err
 		}
-		// With live delivery the reply comes in like any message. Waiting here
+		// With live delivery the replies come in like any message. Waiting here
 		// instead would hold recvMu, stalling every other delivery for up to
 		// wait_seconds, and run into the clients' tool-call time limits.
 		switch s.live() {
 		case "channel":
-			return fmt.Sprintf("asked %s (id %s); the reply will arrive as a channel event with reply_to=%q.", args.To, id, id), nil
+			return "asked " + sent(names, ids) + "; each reply will arrive as a channel event with reply_to set to the id it answers.", nil
 		case "claude", "codex":
-			return fmt.Sprintf("asked %s (id %s); the reply will be delivered into this session as a message with reply_to=%q. Keep working or end your turn meanwhile.", args.To, id, id), nil
+			return "asked " + sent(names, ids) + "; each reply will be delivered into this session as a message with reply_to set to the id it answers. Keep working or end your turn meanwhile.", nil
 		}
-		return s.awaitReply(ctx, m, id, args.To, wait(45))
+		return s.awaitReplies(ctx, m, names, ids, wait(45))
 	case "inbox":
 		if s.live() == "channel" {
 			return "Messages are delivered automatically as channel events in this session; nothing to fetch.", nil
@@ -544,24 +546,44 @@ func unauthorized(err error) bool {
 	return errors.As(err, &se) && se.Code == http.StatusUnauthorized
 }
 
-func recipient(to string) string {
-	if to == "" {
-		return "the whole room"
+// sent says where messages went: each recipient with its message's id, or
+// the whole room when there are no names.
+func sent(names, ids []string) string {
+	if len(names) == 0 {
+		return fmt.Sprintf("the whole room (id %s)", ids[0])
 	}
-	return strconv.Quote(to)
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = fmt.Sprintf("%q (id %s)", names[i], id)
+	}
+	return strings.Join(parts, ", ")
 }
 
-// sendMsg sends p as m, deriving its loop-prevention depth from the message it answers.
-func (s *server) sendMsg(ctx context.Context, m *member, to string, p api.Payload) (string, error) {
+// sendMsg sends p as m to each named recipient, or to the whole room when
+// there are none, deriving its loop-prevention depth from the message it
+// answers. It returns the message ids. A failure part way names the
+// recipients that have it already, so a retry can leave them out.
+func (s *server) sendMsg(ctx context.Context, m *member, to []string, p api.Payload) ([]string, error) {
 	if p.Text == "" {
-		return "", fmt.Errorf("text is required")
+		return nil, fmt.Errorf("text is required")
 	}
 	if p.ReplyTo != "" {
 		s.mu.Lock()
 		p.Depth = s.depths[p.ReplyTo] + 1
 		s.mu.Unlock()
 	}
-	return m.Send(ctx, to, p)
+	if len(to) == 0 {
+		id, err := m.Send(ctx, "", p)
+		if err != nil {
+			return nil, err
+		}
+		return []string{id}, nil
+	}
+	ids, err := m.SendEach(ctx, to, p)
+	if err != nil && len(ids) > 0 {
+		err = fmt.Errorf("%w (already sent to %s)", err, sent(to[:len(ids)], ids))
+	}
+	return ids, err
 }
 
 // receive fetches m's unacknowledged messages (waiting up to wait), records
@@ -614,10 +636,12 @@ func (s *server) remember(msgs []client.Message) {
 	}
 }
 
-// awaitReply waits for the answer to message id, returning it together with
-// anything else received meanwhile (all of it is acknowledged, so all of it is shown).
-func (s *server) awaitReply(ctx context.Context, m *member, id, to string, wait time.Duration) (string, error) {
+// awaitReplies waits until each ask in ids (sent to names) has an answer,
+// returning the answers together with anything else received meanwhile (all
+// of it is acknowledged, so all of it is shown).
+func (s *server) awaitReplies(ctx context.Context, m *member, names, ids []string, wait time.Duration) (string, error) {
 	deadline := time.Now().Add(wait)
+	open := slices.Clone(ids) // asks with no reply yet
 	var got []client.Message
 	for {
 		msgs, err := s.receive(ctx, m, time.Until(deadline))
@@ -626,14 +650,20 @@ func (s *server) awaitReply(ctx context.Context, m *member, id, to string, wait 
 			s.requeue(m, got) // the call was cancelled: keep what it received for later
 			return "", ctx.Err()
 		}
-		replied := slices.ContainsFunc(msgs, func(msg client.Message) bool { return msg.ReplyTo == id })
-		if err != nil || replied || !time.Now().Before(deadline) {
-			out := fmt.Sprintf("asked %s (id %s). ", to, id)
+		for _, msg := range msgs {
+			open = slices.DeleteFunc(open, func(id string) bool { return id == msg.ReplyTo })
+		}
+		if err != nil || len(open) == 0 || !time.Now().Before(deadline) {
+			out := "asked " + sent(names, ids) + ". "
 			switch {
 			case err != nil:
-				out += fmt.Sprintf("Stopped waiting for the reply: %v. It will show up in inbox later.", err)
-			case !replied:
-				out += fmt.Sprintf("No reply within %s; it will show up in inbox later.", wait)
+				out += fmt.Sprintf("Stopped waiting for replies: %v. They will show up in inbox later.", err)
+			case len(open) > 0:
+				var who []string
+				for _, id := range open {
+					who = append(who, strconv.Quote(names[slices.Index(ids, id)]))
+				}
+				out += fmt.Sprintf("No reply within %s from %s; late replies show up in inbox.", wait, strings.Join(who, ", "))
 			}
 			if len(got) > 0 {
 				out += "\n" + client.Format(m.ID.RoomName, got)

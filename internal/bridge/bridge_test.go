@@ -69,7 +69,7 @@ func TestBridge(t *testing.T) {
 	m, _ := client.New(ts.URL, admin).CreateRoom(ctx, "proj", "asker")
 	key := e2ee.NewKey().String()
 	asker, _ := client.NewAgent(client.Identity{Relay: ts.URL, RoomID: m.RoomID, RoomName: "proj", ParticipantID: m.ParticipantID, Name: "asker", Owner: true, Token: m.Token, RoomKey: key})
-	inv, _ := asker.Relay.CreateInvite(ctx, m.RoomID, time.Hour)
+	inv, _ := asker.Relay.CreateInvite(ctx, m.RoomID, time.Hour, 1)
 	j, err := client.New(ts.URL, "").Join(ctx, inv.Token, "codex")
 	if err != nil {
 		t.Fatal(err)

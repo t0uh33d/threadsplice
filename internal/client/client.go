@@ -117,10 +117,22 @@ func (c *Client) CreateRoom(ctx context.Context, name, owner string) (api.Member
 	return m, err
 }
 
-// CreateInvite mints a single-use invite token (owner only).
-func (c *Client) CreateInvite(ctx context.Context, room string, ttl time.Duration) (api.Invite, error) {
+// ErrMultiUseUnsupported is CreateInvite's error from a relay that predates
+// invites with more than one use.
+var ErrMultiUseUnsupported = errors.New("this relay only makes single-use invites; upgrade threadsplice on the relay")
+
+// CreateInvite mints an invite token (owner only) that admits uses joins.
+func (c *Client) CreateInvite(ctx context.Context, room string, ttl time.Duration, uses int) (api.Invite, error) {
+	req := api.CreateInviteRequest{TTLSeconds: int(ttl.Seconds())}
+	if uses > 1 {
+		req.Uses = uses // only then: older relays refuse the field
+	}
 	var inv api.Invite
-	err := c.do(ctx, "POST", "/v1/rooms/"+room+"/invites", api.CreateInviteRequest{TTLSeconds: int(ttl.Seconds())}, &inv)
+	err := c.do(ctx, "POST", "/v1/rooms/"+room+"/invites", req, &inv)
+	var se *StatusError
+	if req.Uses > 0 && errors.As(err, &se) && se.Code == http.StatusBadRequest && strings.Contains(se.Msg, `unknown field "uses"`) {
+		err = ErrMultiUseUnsupported
+	}
 	return inv, err
 }
 

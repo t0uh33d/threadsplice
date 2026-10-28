@@ -61,7 +61,7 @@ func machineRoomConfig(t *testing.T, cfg relay.Config) (mac, bob *client.Agent) 
 	if mac, err = client.NewAgent(id); err != nil {
 		t.Fatal(err)
 	}
-	inv, err := mac.Relay.CreateInvite(ctx, m.RoomID, time.Hour)
+	inv, err := mac.Relay.CreateInvite(ctx, m.RoomID, time.Hour, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

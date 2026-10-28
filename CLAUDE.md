@@ -20,7 +20,7 @@ CI runs vet, the race tests and `go build -trimpath` on Linux, macOS and Windows
 | `cmd/threadsplice/` | CLI. `main.go` holds the core subcommands, `sessions` included; `tty.go` reads an invite at a hidden prompt. `mcp` (in `agents.go`), `setup`, `hook`, `ui` and `bridge` (`bridge.go`, which dispatches to `bridge_codex.go` and `bridge_acp.go`) register into `extra` from their own files |
 | `internal/api` | Wire types and `ValidName` |
 | `internal/e2ee` | Room key, seal/open |
-| `internal/relay` | HTTP API and SQLite store (schema v2) |
+| `internal/relay` | HTTP API and SQLite store (schema v3) |
 | `internal/client` | Relay client; identity and session files; session members (`children.go`), bindings (`bindings.go`), the memberships a session can join under (`machines.go`), `DefaultMachineName` (`machinename.go`); `Agent` (seal/open, replay dedupe); the `Envelope` and `Format` frames |
 | `internal/mcp` | stdio MCP server; session mode and the `join`/`leave` tools (`session.go`); live deliverers: Claude inbox socket, `codex queue`, channel push, or hold |
 | `internal/hooks` | Lifecycle hooks (session mode in `session.go`), and the `setup` text for each agent |

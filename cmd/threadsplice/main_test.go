@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/t0uh33d/threadsplice/internal/api"
 	"github.com/t0uh33d/threadsplice/internal/client"
@@ -337,6 +339,88 @@ func TestRoomCreateAndJoin(t *testing.T) {
 	out = capture(t, func() error { return run(ctx, []string{"revoke", "-as", machine, machine + ".repo"}) })
 	if !strings.Contains(out, `Revoked "`+machine+`.repo".`) {
 		t.Errorf("revoke a session member: %s", out)
+	}
+}
+
+// invite -uses lets a fleet join with one invite. ask hands each recipient
+// its own copy and waits for every reply, printing whatever arrives; it fails,
+// after printing, when a reply is still missing.
+func TestFleetAndAsk(t *testing.T) {
+	ctx := context.Background()
+	const admin = "test-admin-token-0123456789"
+	rs, err := relay.New(relay.Config{DBPath: filepath.Join(t.TempDir(), "r.db"), AdminToken: admin, Log: slog.New(slog.DiscardHandler)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(rs.Handler())
+	t.Cleanup(func() { ts.Close(); rs.Close() })
+	t.Setenv("THREADSPLICE_HOME", t.TempDir())
+	capture(t, func() error {
+		return run(ctx, []string{"room", "create", "-relay", ts.URL, "-name", "proj", "-as", "lead", "-admin-token", admin})
+	})
+	out := capture(t, func() error { return run(ctx, []string{"invite", "-as", "lead", "-uses", "2"}) })
+	if !strings.Contains(out, "Invite (admits 2 joins, expires") || !strings.Contains(out, "\n  threadsplice join -as NAME\n") {
+		t.Errorf("fleet invite:\n%s", out)
+	}
+	var invite string
+	for _, l := range strings.Split(out, "\n") {
+		if strings.HasPrefix(l, "  "+ts.URL+"#") {
+			invite = strings.TrimSpace(l)
+		}
+	}
+	workers := map[string]*client.Agent{}
+	for _, n := range []string{"w1", "w2"} {
+		capture(t, func() error {
+			return withStdin(t, invite+"\n", func() error { return run(ctx, []string{"join", "-as", n}) })
+		})
+		if workers[n], err = client.OpenAgent(n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := withStdin(t, invite+"\n", func() error { return run(ctx, []string{"join", "-as", "w3"}) }); err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Errorf("a third join with a 2-use invite: %v", err)
+	}
+	for _, uses := range []string{"0", "101"} {
+		var ue usageError
+		if err := run(ctx, []string{"invite", "-as", "lead", "-uses", uses}); !errors.As(err, &ue) {
+			t.Errorf("invite -uses %s: %v, want a usage error", uses, err)
+		}
+	}
+
+	answer := func(a *client.Agent, text string) {
+		msgs, _ := a.Inbox(ctx, 10*time.Second)
+		if len(msgs) == 1 && msgs[0].Kind == api.KindAsk {
+			a.Send(ctx, "lead", api.Payload{Kind: api.KindReply, ReplyTo: msgs[0].ID, Text: text})
+		}
+	}
+	go answer(workers["w1"], "w1 done")
+	go answer(workers["w2"], "w2 done")
+	out = capture(t, func() error {
+		return run(ctx, []string{"ask", "-as", "lead", "-to", "w1,w2", "-wait", "10s", "-json", "build it"})
+	})
+	var replies []string
+	for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(l), &m); err != nil {
+			t.Fatalf("ask -json printed %q: %v", l, err)
+		}
+		if m["reply_to"] != "" {
+			replies = append(replies, m["text"].(string))
+		}
+	}
+	slices.Sort(replies)
+	if !slices.Equal(replies, []string{"w1 done", "w2 done"}) {
+		t.Fatalf("ask's replies: %q\n%s", replies, out)
+	}
+
+	go answer(workers["w1"], "w1 again")
+	var askErr error
+	out = capture(t, func() error {
+		askErr = run(ctx, []string{"ask", "-as", "lead", "-to", "w1,w2", "-wait", "2s", "again?"})
+		return nil
+	})
+	if !strings.Contains(out, "w1 again") || askErr == nil || !strings.Contains(askErr.Error(), `no reply from "w2" within 2s`) {
+		t.Fatalf("ask with a reply missing: %v\n%s", askErr, out)
 	}
 }
 

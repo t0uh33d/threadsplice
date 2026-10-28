@@ -66,7 +66,7 @@ func room(t *testing.T, base, name, owner string, others ...string) []*client.Ag
 	agents := []*client.Agent{mustAgent(t, client.Identity{Alias: owner, Relay: base, RoomID: m.RoomID, RoomName: name,
 		ParticipantID: m.ParticipantID, Name: owner, Owner: true, Token: m.Token, RoomKey: key.String()})}
 	for _, n := range others {
-		inv, err := agents[0].Relay.CreateInvite(ctx, m.RoomID, time.Hour)
+		inv, err := agents[0].Relay.CreateInvite(ctx, m.RoomID, time.Hour, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -110,7 +110,7 @@ func TestRelayEndToEnd(t *testing.T) {
 	alice, bob, carol := ag[0], ag[1], ag[2]
 
 	// Only the owner invites.
-	if _, err := bob.Relay.CreateInvite(ctx, bob.ID.RoomID, time.Hour); status(err) != 403 {
+	if _, err := bob.Relay.CreateInvite(ctx, bob.ID.RoomID, time.Hour, 1); status(err) != 403 {
 		t.Fatalf("non-owner invite: %v", err)
 	}
 
@@ -287,7 +287,7 @@ func TestLateJoinerStartsAtCursor(t *testing.T) {
 		}
 	}
 	ag[1].Inbox(ctx, 0) // bob consumes them
-	inv, err := ag[0].Relay.CreateInvite(ctx, ag[0].ID.RoomID, time.Hour)
+	inv, err := ag[0].Relay.CreateInvite(ctx, ag[0].ID.RoomID, time.Hour, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +314,7 @@ func TestInvites(t *testing.T) {
 	owner := room(t, ts.URL, "proj", "alice")[0]
 	anon := client.New(ts.URL, "")
 
-	inv, err := owner.Relay.CreateInvite(ctx, owner.ID.RoomID, time.Hour)
+	inv, err := owner.Relay.CreateInvite(ctx, owner.ID.RoomID, time.Hour, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,13 +333,45 @@ func TestInvites(t *testing.T) {
 	if _, err := anon.Join(ctx, "not-a-real-invite", "zed"); status(err) != 403 {
 		t.Fatalf("bogus invite: %v", err)
 	}
-	short, err := owner.Relay.CreateInvite(ctx, owner.ID.RoomID, time.Second)
+	short, err := owner.Relay.CreateInvite(ctx, owner.ID.RoomID, time.Second, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(1100 * time.Millisecond)
 	if _, err := anon.Join(ctx, short.Token, "late"); status(err) != 403 {
 		t.Fatalf("expired invite: %v", err)
+	}
+
+	// A fleet invite admits its number of joins, then no more; a name clash
+	// doesn't spend one.
+	fleet, err := owner.Relay.CreateInvite(ctx, owner.ID.RoomID, time.Hour, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := anon.Join(ctx, fleet.Token, "worker-1"); err != nil {
+		t.Fatalf("first use: %v", err)
+	}
+	if _, err := anon.Join(ctx, fleet.Token, "worker-1"); status(err) != 409 {
+		t.Fatalf("name clash: %v", err)
+	}
+	if _, err := anon.Join(ctx, fleet.Token, "worker-2"); err != nil {
+		t.Fatalf("second use: %v", err)
+	}
+	if _, err := anon.Join(ctx, fleet.Token, "worker-3"); status(err) != 403 {
+		t.Fatalf("third use of a 2-use invite: %v", err)
+	}
+	for _, uses := range []int{-1, 101} {
+		body := strings.NewReader(fmt.Sprintf(`{"uses": %d}`, uses))
+		req, _ := http.NewRequest("POST", ts.URL+"/v1/rooms/"+owner.ID.RoomID+"/invites", body)
+		req.Header.Set("Authorization", "Bearer "+owner.ID.Token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 400 {
+			t.Errorf("invite with %d uses: status %d, want 400", uses, resp.StatusCode)
+		}
 	}
 }
 
@@ -484,7 +516,7 @@ func TestChildren(t *testing.T) {
 	}
 
 	// Members aren't owners: no invites, no revoking, no whole-room log.
-	if _, err := reviewer.Relay.CreateInvite(ctx, reviewer.ID.RoomID, time.Hour); status(err) != 403 {
+	if _, err := reviewer.Relay.CreateInvite(ctx, reviewer.ID.RoomID, time.Hour, 1); status(err) != 403 {
 		t.Fatalf("member invites: %v", err)
 	}
 	if err := reviewer.Relay.Revoke(ctx, reviewer.ID.RoomID, pc.ID.ParticipantID); status(err) != 403 {
@@ -506,7 +538,7 @@ func TestChildren(t *testing.T) {
 	// A top-level member's name and a dot are its sessions' namespace.
 	anon := client.New(ts.URL, "")
 	invite := func() string {
-		inv, err := alice.Relay.CreateInvite(ctx, alice.ID.RoomID, time.Hour)
+		inv, err := alice.Relay.CreateInvite(ctx, alice.ID.RoomID, time.Hour, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -653,7 +685,7 @@ func TestNamespaces(t *testing.T) {
 	alice := room(t, ts.URL, "proj", "alice")[0]
 	join := func(name string) (*client.Agent, error) {
 		t.Helper()
-		inv, err := alice.Relay.CreateInvite(ctx, alice.ID.RoomID, time.Hour)
+		inv, err := alice.Relay.CreateInvite(ctx, alice.ID.RoomID, time.Hour, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -836,14 +868,52 @@ CREATE INDEX messages_room_seq ON messages (room_id, seq);
 PRAGMA user_version = 1;
 `
 
-// A v1 database migrates when a relay opens it: its data survives,
-// user_version becomes 2 and members stay one level deep. A fresh database
-// starts at v2, and a newer one is refused.
-func TestMigrateV1(t *testing.T) {
+// v2Additions is what v2 relays added to v1Schema: session members.
+const v2Additions = `
+CREATE TABLE children (
+	room_id   TEXT NOT NULL,
+	child_id  TEXT PRIMARY KEY,
+	parent_id TEXT NOT NULL,
+	CHECK (child_id <> parent_id),
+	FOREIGN KEY (room_id, child_id)  REFERENCES participants (room_id, id) ON DELETE CASCADE,
+	FOREIGN KEY (room_id, parent_id) REFERENCES participants (room_id, id) ON DELETE CASCADE
+);
+CREATE INDEX children_parent ON children (parent_id);
+CREATE TRIGGER children_one_level BEFORE INSERT ON children
+WHEN EXISTS (SELECT 1 FROM children WHERE child_id = NEW.parent_id)
+	OR EXISTS (SELECT 1 FROM children WHERE parent_id = NEW.child_id)
+BEGIN SELECT RAISE(ABORT, 'session members are one level deep'); END;
+PRAGMA user_version = 2;
+`
+
+// A v1 or v2 database migrates when a relay opens it: its data survives,
+// user_version becomes 3, members stay one level deep, and an invite made
+// before the upgrade still admits exactly one join. A fresh database starts
+// at v3, and a newer one is refused.
+func TestMigrate(t *testing.T) {
+	t.Run("v1", func(t *testing.T) { testMigrate(t, v1Schema) })
+	t.Run("v2", func(t *testing.T) { testMigrate(t, v1Schema+v2Additions) })
+
+	var v int
+	fresh := filepath.Join(t.TempDir(), "fresh.db")
+	startRelay(t, fresh, 0)
+	if err := rawDB(t, fresh).QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 3 {
+		t.Fatalf("fresh database's user_version = %d, %v; want 3", v, err)
+	}
+	newer := filepath.Join(t.TempDir(), "newer.db")
+	if _, err := rawDB(t, newer).Exec("PRAGMA user_version = 4"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := relay.New(relay.Config{DBPath: newer, AdminToken: admin}); err == nil || !strings.Contains(err.Error(), "newer than this relay (v3)") {
+		t.Fatalf("opening a v4 database: %v", err)
+	}
+}
+
+func testMigrate(t *testing.T, ddl string) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "relay.db")
 	old := rawDB(t, path)
-	if _, err := old.Exec(v1Schema); err != nil {
+	if _, err := old.Exec(ddl); err != nil {
 		t.Fatal(err)
 	}
 	key := e2ee.NewKey()
@@ -858,6 +928,7 @@ func TestMigrateV1(t *testing.T) {
 		{`INSERT INTO participants (id, room_id, name, token_hash, owner, created_at) VALUES ('P1', 'R1', 'alice', ?, 1, ?)`, []any{hash("alice-token"), now}},
 		{`INSERT INTO participants (id, room_id, name, token_hash, created_at) VALUES ('P2', 'R1', 'bob', ?, ?)`, []any{hash("bob-token"), now}},
 		{`INSERT INTO messages (room_id, id, sender_id, recipient_id, sealed, created_at) VALUES ('R1', 'm1', 'P1', 'P2', ?, ?)`, []any{sealed, now}},
+		{`INSERT INTO invites (token_hash, room_id, created_by, expires_at) VALUES (?, 'R1', 'P1', ?)`, []any{hash("old-invite"), now + time.Hour.Milliseconds()}},
 	} {
 		if _, err := old.Exec(q.sql, q.args...); err != nil {
 			t.Fatal(err)
@@ -884,11 +955,18 @@ func TestMigrateV1(t *testing.T) {
 			t.Errorf("%s: parent %q", p.Name, p.Parent)
 		}
 	}
+	anon := client.New(ts.URL, "")
+	if _, err := anon.Join(ctx, "old-invite", "carol"); err != nil {
+		t.Fatalf("an invite from before the upgrade: %v", err)
+	}
+	if _, err := anon.Join(ctx, "old-invite", "dave"); status(err) != 403 {
+		t.Fatalf("an invite from before the upgrade, used again: %v", err)
+	}
 
 	db := rawDB(t, path)
 	var v int
-	if err := db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 2 {
-		t.Fatalf("user_version = %d, %v; want 2", v, err)
+	if err := db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 3 {
+		t.Fatalf("user_version = %d, %v; want 3", v, err)
 	}
 	for _, pair := range [][]any{
 		{"P1", sub.ID.ParticipantID}, // a member under a member
@@ -897,18 +975,5 @@ func TestMigrateV1(t *testing.T) {
 		if _, err := db.Exec(`INSERT INTO children (room_id, child_id, parent_id) VALUES ('R1', ?, ?)`, pair...); err == nil || !strings.Contains(err.Error(), "one level deep") {
 			t.Errorf("child %v: %v, want the one-level trigger", pair, err)
 		}
-	}
-
-	fresh := filepath.Join(t.TempDir(), "fresh.db")
-	startRelay(t, fresh, 0)
-	if err := rawDB(t, fresh).QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 2 {
-		t.Fatalf("fresh database's user_version = %d, %v; want 2", v, err)
-	}
-	newer := filepath.Join(t.TempDir(), "newer.db")
-	if _, err := rawDB(t, newer).Exec("PRAGMA user_version = 3"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := relay.New(relay.Config{DBPath: newer, AdminToken: admin}); err == nil || !strings.Contains(err.Error(), "newer than this relay (v2)") {
-		t.Fatalf("opening a v3 database: %v", err)
 	}
 }

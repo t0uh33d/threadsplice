@@ -666,7 +666,7 @@ func mintInvite(ctx context.Context, id client.Identity, ttl time.Duration) (inv
 	if err != nil {
 		return inviteView{}, err
 	}
-	inv, err := client.New(id.Relay, id.Token).CreateInvite(ctx, id.RoomID, ttl)
+	inv, err := client.New(id.Relay, id.Token).CreateInvite(ctx, id.RoomID, ttl, 1)
 	if err != nil {
 		return inviteView{}, err
 	}

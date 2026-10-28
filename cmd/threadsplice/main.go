@@ -36,7 +36,8 @@ Relay (run on your server, behind TLS):
 
 Rooms and identities:
   threadsplice room create -relay URL -name ROOM [-as NAME]  create a room, print an invite
-  threadsplice invite [-as NAME]                             print a new single-use invite (owner)
+  threadsplice invite [-as NAME] [-uses N] [-ttl 24h]        print a new invite (owner); -uses lets a
+                                                             fleet of agents join with one
   threadsplice join [-as NAME] [INVITE]                      join a room from another machine; type or
                                                              paste the invite when asked, or pipe it in
   threadsplice revoke [-as NAME] PARTICIPANT                 remove a participant (owner)
@@ -48,7 +49,8 @@ Web UI (local, loopback only):
 
 Messaging:
   threadsplice peers [-as NAME] [-json]                      who is in the room, online, busy
-  threadsplice send [-as NAME] [-to PEER] [-kind ask] TEXT   send (TEXT "-" reads stdin)
+  threadsplice send [-as NAME] [-to PEERS] [-kind ask] TEXT  send (TEXT "-" reads stdin)
+  threadsplice ask [-as NAME] -to PEERS [-wait 2m] TEXT      ask, and wait for every reply (-json)
   threadsplice inbox [-as NAME] [-wait 30s] [-json]          print and acknowledge new messages
 
 Agent integration:
@@ -59,6 +61,7 @@ Agent integration:
   threadsplice bridge codex [-as NAME] [-cwd DIR] ...        headless Codex answering the room
   threadsplice bridge acp [-as NAME] -- AGENT [ARGS...]      headless ACP agent (Copilot, Gemini, OpenCode...)
 
+PEERS is one participant name or several, comma-separated: each gets its own copy.
 Identity selection: -as NAME, else $THREADSPLICE_AS, else the only identity. A session member is
 MACHINE/MEMBER (see identities). room create and join name this machine's membership after its
 kind (mac, linux, wsl, windows); room create -as picks another name. join -as NAME instead adds
@@ -123,6 +126,8 @@ func run(ctx context.Context, args []string) error {
 		return cmdPeers(ctx, args)
 	case "send":
 		return cmdSend(ctx, args)
+	case "ask":
+		return cmdAsk(ctx, args)
 	case "inbox":
 		return cmdInbox(ctx, args)
 	case "version", "--version", "-version":
@@ -221,7 +226,7 @@ func cmdRoomCreate(ctx context.Context, args []string) error {
 		return err
 	}
 	fmt.Printf("Created room %q; you are %q%s.\n", m.RoomName, owner, savedAs(id))
-	if err := printInvite(ctx, id, *ttl); err != nil {
+	if err := printInvite(ctx, id, *ttl, 1); err != nil {
 		return err
 	}
 	fmt.Println(nextStep)
@@ -273,22 +278,26 @@ func cmdInvite(ctx context.Context, args []string) error {
 	fs := flags("invite")
 	as := fs.String("as", "", "identity")
 	ttl := fs.Duration("ttl", 24*time.Hour, "invite lifetime (max 168h)")
+	uses := fs.Int("uses", 1, "how many joins it admits (max 100): one invite for a fleet of agents")
 	if err := parse(fs, args); err != nil {
 		return err
+	}
+	if *uses < 1 || *uses > 100 {
+		return usageError("-uses must be 1 to 100")
 	}
 	id, err := client.Load(*as)
 	if err != nil {
 		return err
 	}
-	return printInvite(ctx, id, *ttl)
+	return printInvite(ctx, id, *ttl, *uses)
 }
 
-func printInvite(ctx context.Context, id client.Identity, ttl time.Duration) error {
+func printInvite(ctx context.Context, id client.Identity, ttl time.Duration, uses int) error {
 	key, err := id.Key()
 	if err != nil {
 		return err
 	}
-	inv, err := client.New(id.Relay, id.Token).CreateInvite(ctx, id.RoomID, ttl)
+	inv, err := client.New(id.Relay, id.Token).CreateInvite(ctx, id.RoomID, ttl, uses)
 	if err != nil {
 		return err
 	}
@@ -301,13 +310,18 @@ func printInvite(ctx context.Context, id client.Identity, ttl time.Duration) err
 	// prompt: in a command line it would land in shell history and the
 	// process list. Each command has a line of its own, with no "# …" after
 	// it: zsh's default (no interactive comments) would run that as arguments.
+	what, fleet := "single use", ""
+	if uses > 1 {
+		what = fmt.Sprintf("admits %d joins", uses)
+		fleet = "Agents that share it (a fleet of containers, say) each need a name of their own:\n  threadsplice join -as NAME\n\n"
+	}
 	fmt.Printf(`
-Invite (single use, expires %s). It contains the room key: share it privately.
+Invite (%s, expires %s). It contains the room key: share it privately.
 
   %s
 
 On the other machine, install thread splice, then join (it asks for the invite):
-%s`, inv.ExpiresAt.Local().Format(time.RFC1123), client.FormatInvite(id.Relay, inv.Token, key), installSteps(hooks.Released(version())))
+%s%s`, what, inv.ExpiresAt.Local().Format(time.RFC1123), client.FormatInvite(id.Relay, inv.Token, key), installSteps(hooks.Released(version())), fleet)
 	return nil
 }
 
@@ -563,34 +577,15 @@ func cmdPeers(ctx context.Context, args []string) error {
 func cmdSend(ctx context.Context, args []string) error {
 	fs := flags("send")
 	as := fs.String("as", "", "identity")
-	to := fs.String("to", "", "recipient participant name (default: whole room)")
+	to := fs.String("to", "", "recipient, or several separated by commas (default: whole room)")
 	kind := fs.String("kind", api.KindMessage, "message, ask (expects a reply) or reply")
 	replyTo := fs.String("reply-to", "", "id of the message this answers")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
-	// Go's flag package stops at the first non-flag: `send hi -to bob` would
-	// otherwise send "hi -to bob" to the whole room.
-	for _, a := range fs.Args() {
-		name, _, _ := strings.Cut(strings.TrimLeft(a, "-"), "=")
-		if strings.HasPrefix(a, "-") && fs.Lookup(name) != nil {
-			return usageError(fmt.Sprintf("send: flag %s must come before the message text", a))
-		}
-	}
-	text := strings.Join(fs.Args(), " ")
-	if text == "-" {
-		const limit = 96 << 10
-		b, err := io.ReadAll(io.LimitReader(os.Stdin, limit+1))
-		if err != nil {
-			return err
-		}
-		if len(b) > limit {
-			return fmt.Errorf("message on stdin is larger than %d KiB", limit>>10)
-		}
-		text = string(b)
-	}
-	if strings.TrimSpace(text) == "" {
-		return usageError("usage: threadsplice send [-to PEER] [-kind ask] TEXT")
+	text, err := messageText(fs, "usage: threadsplice send [-to PEERS] [-kind ask] TEXT")
+	if err != nil {
+		return err
 	}
 	if *kind != api.KindMessage && *kind != api.KindAsk && *kind != api.KindReply {
 		return usageError("-kind must be message, ask or reply")
@@ -599,12 +594,105 @@ func cmdSend(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	id, err := a.Send(ctx, *to, api.Payload{Kind: *kind, Text: text, ReplyTo: *replyTo})
+	p := api.Payload{Kind: *kind, Text: text, ReplyTo: *replyTo}
+	names := client.Recipients(*to)
+	if len(names) == 0 {
+		id, err := a.Send(ctx, "", p)
+		if err == nil {
+			fmt.Println(id)
+		}
+		return err
+	}
+	ids, err := a.SendEach(ctx, names, p)
+	for _, id := range ids { // those that went out, also when a later one failed
+		fmt.Println(id)
+	}
+	return err
+}
+
+// cmdAsk sends an ask to each recipient and waits for every reply: a
+// pipeline's or a script's way to hand agents a task and collect the results.
+// It prints whatever arrives meanwhile, since reading acknowledges it, and
+// fails when a reply is still missing at the end.
+func cmdAsk(ctx context.Context, args []string) error {
+	fs := flags("ask")
+	as := fs.String("as", "", "identity")
+	to := fs.String("to", "", "recipient, or several separated by commas: each gets its own copy")
+	wait := fs.Duration("wait", 2*time.Minute, "how long to wait for every reply")
+	replyTo := fs.String("reply-to", "", "id of the message this follows up on")
+	asJSON := fs.Bool("json", false, "one JSON object per message")
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+	const askUsage = "usage: threadsplice ask -to PEERS [-wait 2m] [-json] TEXT"
+	text, err := messageText(fs, askUsage)
 	if err != nil {
 		return err
 	}
-	fmt.Println(id)
+	names := client.Recipients(*to)
+	if len(names) == 0 {
+		return usageError(askUsage)
+	}
+	a, err := client.OpenAgent(*as)
+	if err != nil {
+		return err
+	}
+	ids, err := a.SendEach(ctx, names, api.Payload{Kind: api.KindAsk, Text: text, ReplyTo: *replyTo})
+	if err != nil {
+		if len(ids) > 0 {
+			err = fmt.Errorf("%w (asked already: %s)", err, strings.Join(names[:len(ids)], ", "))
+		}
+		return err
+	}
+	open := slices.Clone(ids) // asks with no reply yet
+	deadline := time.Now().Add(*wait)
+	for len(open) > 0 && time.Now().Before(deadline) {
+		msgs, err := a.Inbox(ctx, min(time.Until(deadline), 30*time.Second))
+		printMessages(a.ID.RoomName, msgs, *asJSON)
+		if err != nil {
+			return err
+		}
+		for _, m := range msgs {
+			open = slices.DeleteFunc(open, func(id string) bool { return id == m.ReplyTo })
+		}
+	}
+	if len(open) > 0 {
+		var who []string
+		for _, id := range open {
+			who = append(who, strconv.Quote(names[slices.Index(ids, id)]))
+		}
+		return fmt.Errorf("no reply from %s within %s; late replies show up in inbox", strings.Join(who, ", "), *wait)
+	}
 	return nil
+}
+
+// messageText is a send or ask command's message: the arguments after its
+// flags, or stdin when that is "-".
+func messageText(fs *flag.FlagSet, usage string) (string, error) {
+	// Go's flag package stops at the first non-flag: `send hi -to bob` would
+	// otherwise send "hi -to bob" to the whole room.
+	for _, a := range fs.Args() {
+		name, _, _ := strings.Cut(strings.TrimLeft(a, "-"), "=")
+		if strings.HasPrefix(a, "-") && fs.Lookup(name) != nil {
+			return "", usageError(fmt.Sprintf("%s: flag %s must come before the message text", fs.Name(), a))
+		}
+	}
+	text := strings.Join(fs.Args(), " ")
+	if text == "-" {
+		const limit = 96 << 10
+		b, err := io.ReadAll(io.LimitReader(os.Stdin, limit+1))
+		if err != nil {
+			return "", err
+		}
+		if len(b) > limit {
+			return "", fmt.Errorf("message on stdin is larger than %d KiB", limit>>10)
+		}
+		text = string(b)
+	}
+	if strings.TrimSpace(text) == "" {
+		return "", usageError(usage)
+	}
+	return text, nil
 }
 
 func cmdInbox(ctx context.Context, args []string) error {
@@ -626,16 +714,20 @@ func cmdInbox(ctx context.Context, args []string) error {
 			return err
 		}
 		if len(msgs) > 0 || !time.Now().Before(deadline) {
-			if *asJSON {
-				enc := json.NewEncoder(os.Stdout)
-				for _, m := range msgs {
-					enc.Encode(jsonMessage(m))
-				}
-				return nil
-			}
-			fmt.Print(client.Format(a.ID.RoomName, msgs))
+			printMessages(a.ID.RoomName, msgs, *asJSON)
 			return nil
 		}
+	}
+}
+
+func printMessages(room string, msgs []client.Message, asJSON bool) {
+	if !asJSON {
+		fmt.Print(client.Format(room, msgs))
+		return
+	}
+	enc := json.NewEncoder(os.Stdout)
+	for _, m := range msgs {
+		enc.Encode(jsonMessage(m))
 	}
 }
 

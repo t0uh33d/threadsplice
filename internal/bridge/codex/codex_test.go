@@ -467,7 +467,7 @@ func TestBridgeEndToEnd(t *testing.T) {
 	}
 	key := e2ee.NewKey().String()
 	asker, _ := client.NewAgent(client.Identity{Relay: ts.URL, RoomID: m.RoomID, RoomName: "proj", ParticipantID: m.ParticipantID, Name: "asker", Owner: true, Token: m.Token, RoomKey: key})
-	inv, err := asker.Relay.CreateInvite(ctx, m.RoomID, time.Hour)
+	inv, err := asker.Relay.CreateInvite(ctx, m.RoomID, time.Hour, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

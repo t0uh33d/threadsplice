@@ -173,3 +173,35 @@ func TestCheckRelayURL(t *testing.T) {
 		}
 	}
 }
+
+// CreateInvite sends uses only above 1, and reads an older relay's refusal
+// of the field (it decodes strictly) as ErrMultiUseUnsupported.
+func TestCreateInviteUses(t *testing.T) {
+	var got []string
+	old := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			TTLSeconds int `json:"ttl_seconds,omitempty"`
+		}
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			got = append(got, "refused")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(api.Error{Error: "invalid JSON body: " + err.Error()})
+			return
+		}
+		got = append(got, "ok")
+		json.NewEncoder(w).Encode(api.Invite{Token: "tok"})
+	}))
+	defer old.Close()
+	c := New(old.URL, "owner-token")
+	if _, err := c.CreateInvite(context.Background(), "R", time.Hour, 1); err != nil {
+		t.Fatalf("single use from an old relay: %v", err)
+	}
+	if _, err := c.CreateInvite(context.Background(), "R", time.Hour, 5); err != ErrMultiUseUnsupported {
+		t.Fatalf("5 uses from an old relay: %v, want ErrMultiUseUnsupported", err)
+	}
+	if strings.Join(got, ",") != "ok,refused" {
+		t.Fatalf("requests: %v", got)
+	}
+}
