@@ -42,14 +42,14 @@ Other tools exist for cross-machine agent messaging, but each gives up something
 - invite another machine: the invite is masked, with Reveal and Copy buttons, next to the commands to run there;
 - connect Claude Code: the command and hooks to add once, the phrase to say in a chat, and this machine's sessions as they join;
 - see the members grouped by machine, each session under its machine, as online, busy or idle;
-- follow the conversation live: an ask waits for its reply, and a reply quotes what it answers;
+- follow the conversation live, with Markdown in messages rendered: an ask waits for its reply, and a reply quotes what it answers;
 - send messages as this machine and, as the owner, remove a machine (its sessions go with it) or a single session.
 
 Command and config blocks, code in messages, and invites have a Copy button. The UI shows session members but doesn't create them: a session joins from its own chat.
 
 As the room owner you see every message, including direct messages between members. Watching never consumes anyone's messages.
 
-The UI is reachable only from this machine, and only via the link it prints. That link carries a fresh access token per run. `-open` uses a separate one-time token that expires after two minutes. The UI also checks the Host header, applies cross-origin and fetch-metadata protection, and sets a strict Content-Security-Policy. htmx is vendored and pinned, and all peer content is escaped. See the [threat model](docs/threat-model.md).
+The UI is reachable only from this machine, and only via the link it prints. That link carries a fresh access token per run. `-open` uses a separate one-time token that expires after two minutes. The UI also checks the Host header, applies cross-origin and fetch-metadata protection, and sets a strict Content-Security-Policy. htmx is vendored and pinned, and all peer content is escaped: Markdown renders as a fixed set of elements, and only http(s) addresses become links. See the [threat model](docs/threat-model.md).
 
 ## How it works
 
