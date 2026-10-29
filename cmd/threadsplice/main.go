@@ -449,25 +449,34 @@ func cmdRevoke(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	for _, p := range ps {
-		if p.Name == fs.Arg(0) || p.ID == fs.Arg(0) {
-			if err := a.Relay.Revoke(ctx, a.ID.RoomID, p.ID); err != nil {
-				return err
-			}
-			fmt.Printf("Revoked %q. Their access ends now; anything they already received stays readable to them.\n", p.Name)
-			members := 0
-			for _, c := range ps {
-				if c.Parent == p.ID && !c.Revoked {
-					members++
-				}
-			}
-			if members > 0 { // the relay revokes a machine's session members with it
-				fmt.Printf("Its %d session member(s) are revoked with it.\n", members)
-			}
-			return nil
+	p, err := client.Lookup(ps, fs.Arg(0))
+	switch {
+	case errors.Is(err, client.ErrNoParticipant):
+		return fmt.Errorf("no participant %q in room %q", fs.Arg(0), a.ID.RoomName)
+	case err != nil:
+		return err
+	case p.ID == a.ID.ParticipantID:
+		return fmt.Errorf("%q is you: revoking yourself would leave the room without an owner", fs.Arg(0))
+	case p.Revoked:
+		return fmt.Errorf("%q is revoked already", p.Name)
+	}
+	if err := a.Relay.Revoke(ctx, a.ID.RoomID, p.ID); err != nil {
+		return err
+	}
+	fmt.Printf("Revoked %q. Their access ends now; anything they already received stays readable to them.\n", p.Name)
+	if p.Parent == "" { // a session member joined with no invite
+		fmt.Println("If they joined with an invite others share, such as a fleet's, give the others a new invite.")
+	}
+	members := 0
+	for _, c := range ps {
+		if c.Parent == p.ID && !c.Revoked {
+			members++
 		}
 	}
-	return fmt.Errorf("no participant %q in room %q", fs.Arg(0), a.ID.RoomName)
+	if members > 0 { // the relay revokes a machine's session members with it
+		fmt.Printf("Its %d session member(s) are revoked with it.\n", members)
+	}
+	return nil
 }
 
 // cmdIdentities lists the identities on this machine, each machine
@@ -637,7 +646,7 @@ func cmdAsk(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	ids, err := a.SendEach(ctx, names, api.Payload{Kind: api.KindAsk, Text: text, ReplyTo: *replyTo})
+	ids, toIDs, err := a.SendEachTo(ctx, names, api.Payload{Kind: api.KindAsk, Text: text, ReplyTo: *replyTo})
 	if err != nil {
 		if len(ids) > 0 {
 			err = fmt.Errorf("%w (asked already: %s)", err, strings.Join(names[:len(ids)], ", "))
@@ -653,7 +662,13 @@ func cmdAsk(ctx context.Context, args []string) error {
 			return err
 		}
 		for _, m := range msgs {
-			open = slices.DeleteFunc(open, func(id string) bool { return id == m.ReplyTo })
+			if m.Err != nil || m.ReplyTo == "" {
+				continue
+			}
+			// Only the participant an ask went to can answer it.
+			open = slices.DeleteFunc(open, func(id string) bool {
+				return id == m.ReplyTo && m.From == toIDs[slices.Index(ids, id)]
+			})
 		}
 	}
 	if len(open) > 0 {

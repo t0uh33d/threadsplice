@@ -86,8 +86,9 @@ type server struct {
 // replaced member held are unacknowledged, and come back when it's bound again.
 type member struct {
 	*client.Agent
-	recvMu  sync.Mutex       // serializes fetch+ack so two paths never present the same message
-	pending []client.Message // fetched by the deliverer but not handed off yet (guarded by recvMu)
+	recvMu   sync.Mutex       // serializes fetch+ack so two paths never present the same message
+	pending  []client.Message // fetched by the deliverer but not handed off yet (guarded by recvMu)
+	tooLarge string           // sender/id of the pending message live delivery can't take (guarded by recvMu)
 }
 
 type message struct {
@@ -493,7 +494,7 @@ func (s *server) tool(ctx context.Context, m *member, name string, args toolArgs
 			return "", fmt.Errorf("kind must be message, ask or reply")
 		}
 		names := client.Recipients(args.To)
-		ids, err := s.sendMsg(ctx, m, names, api.Payload{Kind: args.Kind, Text: args.Text, ReplyTo: args.ReplyTo})
+		ids, _, err := s.sendMsg(ctx, m, names, api.Payload{Kind: args.Kind, Text: args.Text, ReplyTo: args.ReplyTo})
 		if err != nil {
 			return "", err
 		}
@@ -503,7 +504,7 @@ func (s *server) tool(ctx context.Context, m *member, name string, args toolArgs
 		if len(names) == 0 {
 			return "", fmt.Errorf("ask needs a recipient (to); to ask the whole room, use send with kind=ask and read the replies with inbox")
 		}
-		ids, err := s.sendMsg(ctx, m, names, api.Payload{Kind: api.KindAsk, Text: args.Text, ReplyTo: args.ReplyTo})
+		ids, toIDs, err := s.sendMsg(ctx, m, names, api.Payload{Kind: api.KindAsk, Text: args.Text, ReplyTo: args.ReplyTo})
 		if err != nil {
 			return "", err
 		}
@@ -516,7 +517,7 @@ func (s *server) tool(ctx context.Context, m *member, name string, args toolArgs
 		case "claude", "codex":
 			return "asked " + sent(names, ids) + "; each reply will be delivered into this session as a message with reply_to set to the id it answers. Keep working or end your turn meanwhile.", nil
 		}
-		return s.awaitReplies(ctx, m, names, ids, wait(45))
+		return s.awaitReplies(ctx, m, names, ids, toIDs, wait(45))
 	case "inbox":
 		if s.live() == "channel" {
 			return "Messages are delivered automatically as channel events in this session; nothing to fetch.", nil
@@ -561,11 +562,12 @@ func sent(names, ids []string) string {
 
 // sendMsg sends p as m to each named recipient, or to the whole room when
 // there are none, deriving its loop-prevention depth from the message it
-// answers. It returns the message ids. A failure part way names the
-// recipients that have it already, so a retry can leave them out.
-func (s *server) sendMsg(ctx context.Context, m *member, to []string, p api.Payload) ([]string, error) {
+// answers. It returns the message ids and, for named recipients, their
+// participant ids. A failure part way names the recipients that have it
+// already, so a retry can leave them out.
+func (s *server) sendMsg(ctx context.Context, m *member, to []string, p api.Payload) (ids, toIDs []string, err error) {
 	if p.Text == "" {
-		return nil, fmt.Errorf("text is required")
+		return nil, nil, fmt.Errorf("text is required")
 	}
 	if p.ReplyTo != "" {
 		s.mu.Lock()
@@ -575,15 +577,15 @@ func (s *server) sendMsg(ctx context.Context, m *member, to []string, p api.Payl
 	if len(to) == 0 {
 		id, err := m.Send(ctx, "", p)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return []string{id}, nil
+		return []string{id}, nil, nil
 	}
-	ids, err := m.SendEach(ctx, to, p)
+	ids, toIDs, err = m.SendEachTo(ctx, to, p)
 	if err != nil && len(ids) > 0 {
 		err = fmt.Errorf("%w (already sent to %s)", err, sent(to[:len(ids)], ids))
 	}
-	return ids, err
+	return ids, toIDs, err
 }
 
 // receive fetches m's unacknowledged messages (waiting up to wait), records
@@ -597,7 +599,8 @@ func (s *server) receive(ctx context.Context, m *member, wait time.Duration) ([]
 		if err := m.Ack(ctx, msgs[len(msgs)-1].Seq); err != nil { // already seen, so never fetched again: show them anyway
 			s.opt.Log.Warn("ack failed", "err", err)
 		}
-		return msgs, nil
+		// The deliverer fetched these a while ago: the owner may have revoked a sender since.
+		return slices.DeleteFunc(msgs, func(msg client.Message) bool { return msg.Err == nil && m.Revoked(ctx, msg.From) }), nil
 	}
 	deadline := time.Now().Add(wait)
 	for {
@@ -632,14 +635,20 @@ func (s *server) remember(msgs []client.Message) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, m := range msgs {
-		s.depths[m.ID] = m.Depth
+		if m.Err != nil {
+			continue // nothing authenticated to answer
+		}
+		// Senders choose their message ids, so another member can reuse one:
+		// keep the deepest depth seen for an id, which a reuse can't lower.
+		s.depths[m.ID] = max(s.depths[m.ID], m.Depth)
 	}
 }
 
-// awaitReplies waits until each ask in ids (sent to names) has an answer,
-// returning the answers together with anything else received meanwhile (all
-// of it is acknowledged, so all of it is shown).
-func (s *server) awaitReplies(ctx context.Context, m *member, names, ids []string, wait time.Duration) (string, error) {
+// awaitReplies waits until each ask in ids (sent to names, whose participant
+// ids are toIDs) has an answer from the participant it went to, returning the
+// answers together with anything else received meanwhile (all of it is
+// acknowledged, so all of it is shown).
+func (s *server) awaitReplies(ctx context.Context, m *member, names, ids, toIDs []string, wait time.Duration) (string, error) {
 	deadline := time.Now().Add(wait)
 	open := slices.Clone(ids) // asks with no reply yet
 	var got []client.Message
@@ -651,7 +660,13 @@ func (s *server) awaitReplies(ctx context.Context, m *member, names, ids []strin
 			return "", ctx.Err()
 		}
 		for _, msg := range msgs {
-			open = slices.DeleteFunc(open, func(id string) bool { return id == msg.ReplyTo })
+			if msg.Err != nil || msg.ReplyTo == "" {
+				continue
+			}
+			// Only the participant an ask went to can answer it.
+			open = slices.DeleteFunc(open, func(id string) bool {
+				return id == msg.ReplyTo && msg.From == toIDs[slices.Index(ids, id)]
+			})
 		}
 		if err != nil || len(open) == 0 || !time.Now().Before(deadline) {
 			out := "asked " + sent(names, ids) + ". "
@@ -681,7 +696,8 @@ func (s *server) peers(ctx context.Context, m *member) (string, error) {
 		return "", err
 	}
 	out := fmt.Sprintf("Room %q:\n", m.ID.RoomName)
-	for _, p := range ps {
+	more := max(len(ps)-maxListed, 0) // the relay supplies the list
+	for _, p := range ps[:len(ps)-more] {
 		status := "offline"
 		switch {
 		case p.Revoked:
@@ -697,6 +713,9 @@ func (s *server) peers(ctx context.Context, m *member) (string, error) {
 			you = " (you)"
 		}
 		out += fmt.Sprintf("- %s%s: %s\n", p.Name, you, status)
+	}
+	if more > 0 {
+		out += fmt.Sprintf("- and %d more\n", more)
 	}
 	return out, nil
 }
@@ -725,7 +744,15 @@ func (s *server) pushLoop(ctx context.Context, m *member) {
 		}
 		s.remember(msgs)
 		for _, msg := range msgs {
-			s.send(message{Method: "notifications/claude/channel", Params: mustJSON(channelEvent(msg))})
+			switch {
+			case msg.Err != nil:
+				// No content for the model, and its sender and id are the relay's: skip it, as handOff and bridges do.
+				s.opt.Log.Warn("skipping undecryptable message", "seq", msg.Seq)
+			case m.Revoked(ctx, msg.From):
+				s.opt.Log.Warn("skipping a message from a revoked member", "seq", msg.Seq)
+			default:
+				s.send(message{Method: "notifications/claude/channel", Params: mustJSON(channelEvent(msg))})
+			}
 		}
 		if err := m.Ack(ctx, last); err != nil && ctx.Err() == nil {
 			s.opt.Log.Warn("ack failed; messages may be delivered again", "err", err)
@@ -741,12 +768,7 @@ func channelEvent(m client.Message) map[string]any {
 	if m.Direct {
 		meta["to"] = "you"
 	}
-	text := m.Text
-	if m.Err != nil {
-		meta["kind"] = "error"
-		text = "A message from " + m.FromName + " could not be decrypted: " + m.Err.Error()
-	}
-	return map[string]any{"content": text, "meta": meta}
+	return map[string]any{"content": m.Text, "meta": meta}
 }
 
 func mustJSON(v any) json.RawMessage {

@@ -354,6 +354,11 @@ func (s *Server) participants(w http.ResponseWriter, r *http.Request, c caller) 
 	}
 	s.mu.Lock()
 	for i, p := range ps {
+		// A cursor stops on the direct messages its member received: only that
+		// member and the owner, who reads the whole room anyway, may see it.
+		if !c.owner && p.ID != c.id {
+			ps[i].AckedSeq = 0
+		}
 		pr := s.pres[p.ID]
 		if !pr.seen.IsZero() {
 			ps[i].LastSeen, ps[i].State = pr.seen.UTC().Truncate(time.Millisecond), pr.state
@@ -413,6 +418,9 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request, c caller) {
 	}
 	seq, dup, err := s.store.insertMessage(r.Context(), c.room, c.id, req.To, req.ID, req.Sealed)
 	switch {
+	case errors.Is(err, errRevoked): // the owner revoked the sender, or its machine, after auth
+		httpError(w, http.StatusUnauthorized, "invalid or revoked credential")
+		return
 	case errors.Is(err, errNotFound):
 		httpError(w, http.StatusNotFound, "recipient is not an active participant in this room")
 		return

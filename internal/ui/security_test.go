@@ -177,9 +177,12 @@ func TestLaunchToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	try := func(method, path string) *httptest.ResponseRecorder {
+	try := func(method, path string, header ...string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, path, nil)
 		r.Host = "127.0.0.1:4848"
+		for i := 0; i+1 < len(header); i += 2 {
+			r.Header.Set(header[i], header[i+1])
+		}
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, r)
 		return w
@@ -190,9 +193,13 @@ func TestLaunchToken(t *testing.T) {
 	if w := try(http.MethodHead, "/?t="+launch); w.Code != http.StatusUnauthorized {
 		t.Fatalf("HEAD spent the launch token: %d", w.Code)
 	}
-	w := try(http.MethodGet, "/?t="+launch)
-	if c := w.Result().Cookies(); w.Code != http.StatusSeeOther || len(c) != 1 || c[0].Value != token {
-		t.Fatalf("launch link: %d %v", w.Code, c)
+	// The launch page is a file, so the browser calls this a cross-site
+	// navigation, and a strict cookie wouldn't go with a redirect: the answer
+	// is a page that moves on by itself.
+	w := try(http.MethodGet, "/?t="+launch, "Sec-Fetch-Site", "cross-site", "Sec-Fetch-Mode", "navigate", "Sec-Fetch-Dest", "document")
+	if c := w.Result().Cookies(); w.Code != http.StatusOK || len(c) != 1 || c[0].Value != token ||
+		!strings.Contains(w.Body.String(), `<meta http-equiv="refresh" content="0;url=/">`) || strings.Contains(w.Body.String(), launch) {
+		t.Fatalf("launch link: %d %v\n%s", w.Code, c, w.Body)
 	}
 	if w := try(http.MethodGet, "/?t="+launch); w.Code != http.StatusUnauthorized {
 		t.Fatalf("launch token worked twice: %d", w.Code)
@@ -437,7 +444,11 @@ func hostileRelay(t *testing.T, key e2ee.Key, room string) *httptest.Server {
 			reply(w, http.StatusForbidden, api.Error{Error: "spent invite " + req.Invite})
 			return
 		}
-		reply(w, http.StatusCreated, api.Membership{RoomID: room, RoomName: "joined" + evil, ParticipantID: evil, Token: "JOINEDTOKEN0123456789"})
+		pid := "JOINED"
+		if req.Name == "forged" {
+			pid = evil
+		}
+		reply(w, http.StatusCreated, api.Membership{RoomID: room, RoomName: "joined" + evil, ParticipantID: pid, Token: "JOINEDTOKEN0123456789"})
 	})
 	// Room names reach models later: one the relay makes up must not be kept.
 	mux.HandleFunc("POST /v1/rooms", func(w http.ResponseWriter, r *http.Request) {
@@ -595,6 +606,8 @@ func TestHostileRelay(t *testing.T) {
 	must(t, r, http.StatusUnprocessableEntity, "spent invite [redacted]")
 	r = check("join", e.do(http.MethodPost, "/join", url.Values{"invite": {inv}, "name": {"bob"}}, nil))
 	must(t, r, http.StatusUnprocessableEntity, "the relay gave the room an invalid name, so this machine didn")
+	r = check("join forged", e.do(http.MethodPost, "/join", url.Values{"invite": {inv}, "name": {"forged"}}, nil))
+	must(t, r, http.StatusUnprocessableEntity, "the relay returned an invalid membership")
 	r = check("create", e.do(http.MethodPost, "/rooms", url.Values{"relay": {hs.URL}, "room": {"proj"}, "name": {"carol"}, "admin": {admin}, "ttl": {"none"}}, nil))
 	must(t, r, http.StatusUnprocessableEntity, "the relay created the room but gave it an invalid name")
 	if names, _ := client.List(); !slices.Equal(names, []string{"alice"}) {

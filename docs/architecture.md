@@ -49,19 +49,20 @@ Where it runs out:
 | Decision | Why | Ceiling / upgrade path |
 |---|---|---|
 | One Go binary, stdlib `net/http` | Easy to self-host and audit; no framework | — |
-| SQLite (pure-Go `modernc.org/sqlite`), WAL, `synchronous=FULL`, one connection | A returned `seq` is a durability promise. A single writer keeps seq cursors gap-free and check-then-write races impossible. No cgo, so static cross-builds work | One relay process. PostgreSQL only if a multi-node relay is ever needed |
+| SQLite (pure-Go `modernc.org/sqlite`), WAL, `synchronous=FULL`, one connection | A returned `seq` is a durability promise. A single writer keeps check-then-write races impossible. Each room numbers its own messages (`rooms.next_seq`, schema v4), so a seq tells nothing about other rooms. No cgo, so static cross-builds work | One relay process. PostgreSQL only if a multi-node relay is ever needed |
 | HTTP long-poll on a `seq` cursor (`GET …/messages?after=N&wait=25`); waits wake per room | Message rates are LLM-paced. Long-poll is stdlib-only, survives proxies (the 25 s wait stays under common idle timeouts such as nginx's 60 s default), and resuming is just repeating the request with the cursor | SSE on the same cursor for a browser dashboard; WebSocket only for high-frequency features |
 | Idempotent sends keyed on `(sender, message id)` | Retries after a lost response are safe; delivery is at-least-once with dedup, never "exactly once" | — |
-| Server-side ack cursor per participant | One source of truth for "already shown", shared by the MCP server, hooks and the CLI on the same machine | Per-message acks if consumers ever need to skip around |
+| Server-side ack cursor per participant | One source of truth for "already shown", shared by the MCP server, hooks and the CLI on the same machine. Only the participant and the owner see it, since it stops on the direct messages it received | Per-message acks if consumers ever need to skip around |
 | Composite foreign keys `(room_id, participant)` | Cross-room references are impossible in the schema, not just in handler code | — |
 | Bearer tokens, stored as SHA-256 hashes; expiring invites, single-use unless the owner asks for up to 100 joins (`invites.uses_left`, schema v3) | Simple and revocable. A stolen database yields no usable credentials. A fleet of containers can join with one secret, and the count and expiry bound a leak | Short-lived tokens with rotation; per-agent credentials minted by an orchestrator |
 | Session members in a side table, `children (room_id, child_id, parent_id)` (schema v2) | Rebuilding `participants` would break the composite foreign keys into it. A trigger keeps members one level deep | — |
 | `POST /v1/rooms/{room}/participants`: a machine membership creates its session members, named `<its name>.<label>`, with a token its client picked | Only the token's hash travels, so a retry after a lost answer is free: the same name, parent and hash get the same member back (200). Relays from before it registered only GET on that path, so they answer 405, which clients report as "unsupported" | — |
 | Names compared ignoring letter case; `<name>.` belongs to that top-level member's sessions, whichever joined first | Nobody can pass as another member, or as another machine's session | — |
 | A machine is one unit: revoking it revokes its sessions in the same transaction, and they share its send budget. It may create 10 members a minute and hold 32 live ones | Sessions can't outlive or out-send the machine that made them. `auth` also refuses a session whose machine is revoked | — |
+| Revocation is checked where a message is stored and where it is consumed | A send under way when its sender is revoked is refused. The inbox view leaves out what a revoked sender queued, while history keeps it. Revoking a member spends the invite it joined with (`participants.invite_hash`, schema v4) and any invite it made | — |
 | No model, no provider credentials, no command execution | The relay is a mailbox. Nothing it holds or does can act on a machine | — |
 
-Messages expire after a retention period (default 30 days). Spent and expired invites are pruned. The schema is versioned: a relay migrates an older database on start, each step in one transaction (v1 to v2 adds `children`), and refuses a newer one.
+Messages expire after a retention period (default 30 days). Spent and expired invites are pruned. The schema is versioned: a relay migrates an older database on start, each step in one transaction (v1 to v2 adds `children`, v3 multi-use invites, v4 per-room seqs and the invite each member joined with), and refuses a newer one.
 
 ## End-to-end encryption
 
@@ -69,6 +70,7 @@ See the [threat model](threat-model.md) for the full analysis.
 
 - **Room key.** The room creator's CLI generates 32 random bytes. The key travels only inside the invite string's URL fragment, which the CLI never sends to the relay. Session members get it from their machine's file, never through the chat or a tool.
 - **Per message.** AES-256-GCM (`cipher.NewGCMWithRandomNonce`) under an HKDF-SHA256 subkey. Room, sender, recipient and message id are bound as length-prefixed associated data, so the relay can't move or re-attribute a message without decryption failing.
+- **Names.** Those ids are the relay's; the member list that maps them to names is the relay's too. So the payload also carries the sender's name and, for a direct message, the name it was addressed to, and the receiving connector refuses to show a message whose names don't match its own name or the list. Older connectors leave the names out, and their messages go unchecked.
 - **Why not more, yet?**
   - MLS has no production-grade pure-Go implementation.
   - PAKE pairing isn't needed when invites are long random strings.
@@ -127,7 +129,7 @@ There are three mechanisms, chosen per agent:
 - **History without side effects.** It reads the relay's history view (`messages?all=1`), which never moves acknowledgement cursors. The room owner sees the whole room, other identities what they may read. Pages read through the owner's identity when it's on the machine, so watching an agent's room doesn't make that agent look online.
 - **Live updates.** A poller element re-requests the feed every 2 s with the last cursor and appends new rows out of band; the members panel refreshes every 5 s. There's no WebSocket and no client-side state beyond htmx and the small `ui.js`.
 - **Markdown in messages.** The server parses each message into a fixed set of elements (paragraphs, headings, lists, quotes, tables, code, emphasis), and html/template escapes all of their text. Only absolute http(s) addresses become links, which open in a new tab with `rel="noopener noreferrer nofollow"`; images show as links. Parsing stays linear on hostile input.
-- **Access.** Loopback-only listener, per-run token in the printed link (or a two-minute one-time token for `-open`) exchanged for an HttpOnly, SameSite=Strict cookie, exact Host matching against DNS rebinding, `CrossOriginProtection` plus a fetch-metadata check, POST-only state changes, a strict CSP with no inline script or style, capped bodies, and html/template escaping for everything a peer or relay controls.
+- **Access.** Loopback-only listener, per-run token in the printed link (or, for `-open`, a two-minute one-time token in a page only this user can read, so no token reaches a browser's command line) exchanged for an HttpOnly, SameSite=Strict cookie, exact Host matching against DNS rebinding, `CrossOriginProtection` plus a fetch-metadata check, POST-only state changes, a strict CSP with no inline script or style, capped bodies, and html/template escaping for everything a peer or relay controls.
 
 ## Distribution
 

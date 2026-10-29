@@ -3,6 +3,8 @@ package bridge
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"math"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
@@ -144,4 +146,69 @@ func TestBridge(t *testing.T) {
 		}
 	}
 	t.Fatal("no reply to the oversized answer")
+}
+
+// A message whose sender was revoked after the bridge fetched it gets no
+// turn, and a reply to a revoked asker is dropped at once instead of retried.
+// An ask whose depth is out of range gets the limit's refusal, not a turn.
+func TestBridgeRevokedAndDepth(t *testing.T) {
+	ctx := context.Background()
+	const admin = "test-admin-token-0123456789"
+	rs, err := relay.New(relay.Config{DBPath: filepath.Join(t.TempDir(), "r.db"), AdminToken: admin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(rs.Handler())
+	defer func() { ts.Close(); rs.Close() }()
+	m, err := client.New(ts.URL, admin).CreateRoom(ctx, "proj", "lead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := e2ee.NewKey().String()
+	lead, _ := client.NewAgent(client.Identity{Relay: ts.URL, RoomID: m.RoomID, RoomName: "proj", ParticipantID: m.ParticipantID, Name: "lead", Owner: true, Token: m.Token, RoomKey: key})
+	join := func(name string) *client.Agent {
+		inv, _ := lead.Relay.CreateInvite(ctx, m.RoomID, time.Hour, 1)
+		j, err := client.New(ts.URL, "").Join(ctx, inv.Token, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a, _ := client.NewAgent(client.Identity{Relay: ts.URL, RoomID: j.RoomID, RoomName: "proj", ParticipantID: j.ParticipantID, Name: name, Token: j.Token, RoomKey: key})
+		return a
+	}
+	asker, pal, bot := join("asker"), join("pal"), join("codex")
+	opt := Options{MaxDepth: DefaultMaxDepth, Log: slog.New(slog.DiscardHandler)}
+	sess := &fakeSession{}
+
+	asker.Send(ctx, "codex", api.Payload{Kind: api.KindAsk, Text: "run this"})
+	msgs, _, err := bot.Fetch(ctx, -1, 0, "")
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("bot fetched %+v, %v", msgs, err)
+	}
+	if err := lead.Relay.Revoke(ctx, m.RoomID, asker.ID.ParticipantID); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle(ctx, bot, sess, msgs[0], opt); err == nil || !strings.Contains(err.Error(), "revoked") || sess.count() != 0 {
+		t.Errorf("a revoked sender's message: %v, %d turns", err, sess.count())
+	}
+	begin := time.Now()
+	if err := sendReply(ctx, bot, asker.ID.ParticipantID, api.Payload{Kind: api.KindReply, Text: "late"}, opt.Log); !errors.Is(err, client.ErrNoParticipant) || time.Since(begin) > time.Second {
+		t.Errorf("a reply to a revoked asker: %v after %s", err, time.Since(begin))
+	}
+
+	for _, d := range []int{-1, math.MaxInt} {
+		pal.Send(ctx, "codex", api.Payload{Kind: api.KindAsk, Text: "loop?", Depth: d})
+	}
+	msgs, _, _ = bot.Fetch(ctx, -1, 0, "")
+	for _, msg := range msgs {
+		handle(ctx, bot, sess, msg, opt)
+	}
+	replies, err := pal.Inbox(ctx, 5*time.Second)
+	if err != nil || len(replies) != 2 || sess.count() != 0 {
+		t.Fatalf("asks out of range: %d replies, %d turns, %v", len(replies), sess.count(), err)
+	}
+	for _, r := range replies {
+		if !strings.Contains(r.Text, "automatic-reply limit") {
+			t.Errorf("reply = %q, want the limit's refusal", r.Text)
+		}
+	}
 }

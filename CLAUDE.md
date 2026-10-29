@@ -20,7 +20,7 @@ CI runs vet, the race tests and `go build -trimpath` on Linux, macOS and Windows
 | `cmd/threadsplice/` | CLI. `main.go` holds the core subcommands, `sessions` included; `tty.go` reads an invite at a hidden prompt. `mcp` (in `agents.go`), `setup`, `hook`, `ui` and `bridge` (`bridge.go`, which dispatches to `bridge_codex.go` and `bridge_acp.go`) register into `extra` from their own files |
 | `internal/api` | Wire types and `ValidName` |
 | `internal/e2ee` | Room key, seal/open |
-| `internal/relay` | HTTP API and SQLite store (schema v3) |
+| `internal/relay` | HTTP API and SQLite store (schema v4) |
 | `internal/client` | Relay client; identity and session files; session members (`children.go`), bindings (`bindings.go`), the memberships a session can join under (`machines.go`), `DefaultMachineName` (`machinename.go`); `Agent` (seal/open, replay dedupe); the `Envelope` and `Format` frames |
 | `internal/mcp` | stdio MCP server; session mode and the `join`/`leave` tools (`session.go`); live deliverers: Claude inbox socket, `codex queue`, channel push, or hold |
 | `internal/hooks` | Lifecycle hooks (session mode in `session.go`), and the `setup` text for each agent |
@@ -88,7 +88,7 @@ CI runs vet, the race tests and `go build -trimpath` on Linux, macOS and Windows
   - Peer text enters as `toolOutput`, which needs Codex ≥ 0.151. The bridge fails closed when Codex reports an older version or rejects the field.
   - `maxWaitSeconds` (240) must stay under the `tool_timeout_sec = 300` that `setup codex` writes; Codex's documented default is 60 s, and a call it abandons loses the messages it already fetched.
 - **The relay's long-poll cap** (`maxWait`, 30 s) must stay under the client's 60 s HTTP timeout and under proxy read timeouts.
-- **`seq` is relay-wide,** so it has gaps within a room. Participants resume from their server-side `acked_seq`.
+- **`seq` counts per room** (`rooms.next_seq`), but a member still sees gaps: direct messages between others, and what revoked senders queued. Participants resume from their server-side `acked_seq`, which only they and the owner can read.
 - **Setup text** replaces every literal `NAME` with the alias, so keep that word out of the prose. `TestSetup` matches phrases that must not wrap across lines. Vendor config formats there follow the vendors' docs as of October 2026; re-check those docs before changing them. The UI's Connect view has its own copy of the session-mode hooks (`claudeHooks` in `internal/ui/room.go`), and its chat phrase (`joinPhrase`) repeats how `join` picks a membership (`client.MachineMemberships`): keep each pair in step.
 
 ## Conventions

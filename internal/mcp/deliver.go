@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/t0uh33d/threadsplice/internal/client"
@@ -26,6 +27,7 @@ var (
 	maxFailures  = 8                // consecutive failed hand-offs (about a minute) before falling back to hold
 	holdRecheck  = 2 * time.Second  // how often a holding deliverer looks for its session again
 	sessionSlack = 10 * time.Second // clock slack when telling this session's record from an earlier one's
+	argvLimit    = 120 << 10        // codex queue's message: under Linux's 128 KiB per argument, above the send tool's ~96 KB
 )
 
 // headless are the CLAUDE_CODE_ENTRYPOINT values of Claude Code runs nobody
@@ -35,6 +37,14 @@ var (
 var headless = map[string]bool{"sdk-cli": true, "sdk-ts": true, "sdk-py": true, "claude-code-github-action": true}
 
 var errHandOff = errors.New("hand-off failed")
+
+// errTooLarge: codex queue can never take this message, since argv is
+// limited. Like a NUL in it, that is a property of the message, not a broken
+// delivery mechanism.
+var errTooLarge = errors.New("message too large for codex queue")
+
+// errHeld: the oldest message waits for the inbox tool; not a failed hand-off.
+var errHeld = errors.New("held for the inbox tool")
 
 // A deliverer pushes framed messages into the live agent session.
 type deliverer struct {
@@ -240,6 +250,9 @@ func (s *server) deliver(ctx context.Context, m *member, d *deliverer) {
 		switch {
 		case ctx.Err() != nil, s.gone(m, err):
 			return
+		case errors.Is(err, errHeld):
+			fails = 0
+			sleep(ctx, holdRecheck) // live delivery resumes once the inbox tool has taken it
 		case errors.Is(err, errHandOff):
 			if fails++; fails >= maxFailures {
 				s.opt.Log.Warn("live delivery keeps failing; holding messages for the inbox tool", "via", d.name, "err", err)
@@ -266,7 +279,8 @@ func (s *server) deliver(ctx context.Context, m *member, d *deliverer) {
 // so the inbox tool and the deliverer never both present a message. A message
 // whose push fails stays in m.pending, where the next try (or the inbox tool)
 // picks it up: the client drops repeat fetches of a message it has already
-// seen, so it can't simply be fetched again.
+// seen, so it can't simply be fetched again. One too large to push stays there
+// too, behind a notice, until the inbox tool takes it (errHeld).
 func (s *server) handOff(ctx context.Context, m *member, d *deliverer, target string) (more bool, err error) {
 	m.recvMu.Lock()
 	defer m.recvMu.Unlock()
@@ -282,12 +296,32 @@ func (s *server) handOff(ctx context.Context, m *member, d *deliverer, target st
 		m.pending = msgs
 	}
 	msg := m.pending[0]
-	if msg.Err != nil {
+	// Sender and id, as Agent.Fetch's replay check: ids are unique only per
+	// sender, so a bare id would also hold another sender's message.
+	key := msg.From + "/" + msg.ID
+	switch {
+	case msg.Err != nil:
 		// No content for the model, and a turn would cost tokens: log it and move on, as bridges do.
 		s.opt.Log.Warn("skipping undecryptable message", "id", msg.ID, "from", msg.FromName)
-	} else if err := d.push(ctx, target, client.Envelope(m.ID.RoomName, msg, false)); err != nil {
-		return true, fmt.Errorf("%w: %w", errHandOff, err)
-	} else {
+	case m.Revoked(ctx, msg.From):
+		// Fetched before the owner revoked its sender, whose access has ended.
+		s.opt.Log.Warn("skipping a message from a revoked member", "id", msg.ID, "from", msg.FromName)
+	case key == m.tooLarge:
+		return true, errHeld // still the oldest: the inbox tool hasn't taken it yet
+	default:
+		err := d.push(ctx, target, client.Envelope(m.ID.RoomName, msg, false))
+		if errors.Is(err, errTooLarge) {
+			// A fixed notice with no peer text; the prefix keeps Codex's hook from taking it for the user's prompt.
+			notice := fmt.Sprintf("%s %q in room %q (id %q) is too large to deliver here. Call the threadsplice inbox tool to read it.",
+				client.EnvelopePrefix, msg.FromName, m.ID.RoomName, msg.ID)
+			if err = d.push(ctx, target, notice); err == nil {
+				m.tooLarge = key
+				return true, errHeld // unacknowledged: acks are cumulative, so moving past it would lose it
+			}
+		}
+		if err != nil {
+			return true, fmt.Errorf("%w: %w", errHandOff, err)
+		}
 		s.opt.Log.Info("delivered", "id", msg.ID, "kind", msg.Kind, "via", d.name)
 	}
 	m.pending = m.pending[1:]
@@ -374,14 +408,23 @@ func codexPath() (string, error) {
 // echoes the message.
 // ponytail: the envelope travels in argv (codex queue reads it from nowhere
 // else), so other local users can see the decrypted text in the process list
-// while codex queue runs, and a message over ~128 KB (Linux) or ~32 KB
-// (Windows) fails here and ends up with the inbox tool.
+// while codex queue runs. A message too large for argv (over 120 KiB, or 15
+// KiB on Windows) is errTooLarge: the session gets a notice instead, and the
+// message waits for the inbox tool.
 func codexQueue(ctx context.Context, bin, thread, text string) error {
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	// argv can't carry NUL: one in a peer's text would fail every retry.
 	text = strings.ReplaceAll(text, "\x00", "\uFFFD")
-	return exec.CommandContext(ctx, bin, "queue", "--thread", thread, "--message", text).Run()
+	// Windows holds 32,767 UTF-16 units in the whole command line, and its quoting can double a byte.
+	if len(text) > argvLimit || runtime.GOOS == "windows" && len(text) > 15<<10 {
+		return errTooLarge
+	}
+	err := exec.CommandContext(ctx, bin, "queue", "--thread", thread, "--message", text).Run()
+	if errors.Is(err, syscall.E2BIG) { // the rest of argv and the environment count too
+		return errTooLarge
+	}
+	return err
 }
 
 func sleep(ctx context.Context, d time.Duration) {

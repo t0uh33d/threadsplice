@@ -202,8 +202,8 @@ func rowOf(m client.Message, me string) row {
 }
 
 // undecryptable says in plain words why a message can't be shown. Opening
-// fails in e2ee (wrong key, changed on the way, an unknown format) or in
-// decoding what decrypted.
+// fails in e2ee (wrong key, changed on the way, an unknown format), in
+// decoding what decrypted, or in checking the names sealed in it.
 func undecryptable(err error) string {
 	var syntax *json.SyntaxError
 	var typ *json.UnmarshalTypeError
@@ -212,6 +212,8 @@ func undecryptable(err error) string {
 		return "It wasn't sealed with this room's key, or it was changed on the way."
 	case errors.As(err, &syntax), errors.As(err, &typ):
 		return "It decrypted, but it isn't a message thread splice can show."
+	case errors.Is(err, client.ErrNames):
+		return "The names sealed in it don't match the relay's member list: the relay renamed members, or sent it to the wrong one."
 	}
 	return "It isn't in a format this version of thread splice can read."
 }

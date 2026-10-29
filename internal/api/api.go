@@ -67,7 +67,7 @@ type Participant struct {
 	State    string    `json:"state,omitempty"`  // self-reported, e.g. "idle", "busy"
 	LastSeen time.Time `json:"last_seen,omitzero"`
 	Online   bool      `json:"online"`
-	AckedSeq int64     `json:"acked_seq"` // highest message seq the participant has acknowledged
+	AckedSeq int64     `json:"acked_seq"` // highest message seq the participant has acknowledged; 0 to other members but the owner
 	Revoked  bool      `json:"revoked,omitempty"`
 }
 
@@ -85,8 +85,8 @@ type SendResponse struct {
 	Duplicate bool  `json:"duplicate,omitempty"`
 }
 
-// Envelope is a stored message. Seq is a relay-assigned, monotonically
-// increasing cursor; clients resume with GET .../messages?after=<seq>.
+// Envelope is a stored message. Seq is a relay-assigned cursor that increases
+// within the room; clients resume with GET .../messages?after=<seq>.
 type Envelope struct {
 	Seq       int64     `json:"seq"`
 	ID        string    `json:"id"`
@@ -117,6 +117,12 @@ type Payload struct {
 	Text    string `json:"text"`
 	ReplyTo string `json:"reply_to,omitempty"` // id of the message this answers
 	Depth   int    `json:"depth,omitempty"`    // automatic-reply chain length, for loop prevention
+	// Sealed with the text, so the relay can't change them: the sender's own
+	// name and, for a direct message, the name it addressed. Receivers check
+	// them against the member list the relay serves, which it could remap.
+	// Empty from connectors that predate them.
+	Sender    string `json:"sender,omitempty"`
+	Addressee string `json:"addressee,omitempty"`
 }
 
 // Payload kinds.

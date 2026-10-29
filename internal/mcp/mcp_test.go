@@ -317,3 +317,70 @@ func TestToolSession(t *testing.T) {
 		t.Fatalf("peers: %s", out)
 	}
 }
+
+// ask counts an answer only from the member it asked: the owner, who reads
+// every direct message, can't end another member's wait with its own reply.
+func TestAskNeedsTheRecipient(t *testing.T) {
+	ctx := context.Background()
+	alice, bob := pair(t)
+	carol := joinRoom(t, alice, "carol")
+	s := start(t, bob, "hold")
+	s.call("initialize", map[string]any{"protocolVersion": "2025-06-18"})
+	go func() { // alice, the owner, answers bob's ask to carol in her stead
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			msgs, _, _ := alice.Log(ctx, 0, 0)
+			for _, m := range msgs {
+				if m.Kind == api.KindAsk && m.To == carol.ID.ParticipantID {
+					alice.Send(ctx, "bob", api.Payload{Kind: api.KindReply, ReplyTo: m.ID, Text: "forged answer"})
+					return
+				}
+			}
+		}
+	}()
+	out := s.tool("ask", map[string]any{"to": "carol", "text": "ready?", "wait_seconds": 2})
+	if !strings.Contains(out, "forged answer") || !strings.Contains(out, `No reply within 2s from "carol"`) {
+		t.Fatalf("ask answered by someone else: %s", out)
+	}
+}
+
+// A reused message id can only end a chain early, and a depth out of range
+// counts as a chain that has used its budget up.
+func TestDepthsOnlyGrow(t *testing.T) {
+	ctx := context.Background()
+	alice, bob := pair(t)
+	carol := joinRoom(t, alice, "carol")
+	s := start(t, alice, "hold")
+	s.call("initialize", map[string]any{"protocolVersion": "2025-06-18"})
+	bob.SendID(ctx, "M1", "alice", api.Payload{Kind: api.KindAsk, Text: "deep", Depth: 3})
+	carol.SendID(ctx, "M1", "alice", api.Payload{Kind: api.KindAsk, Text: "same id, shallow"})
+	bob.SendID(ctx, "M2", "alice", api.Payload{Kind: api.KindAsk, Text: "hostile", Depth: -1})
+	if out := s.tool("inbox", map[string]any{"wait_seconds": 5}); strings.Count(out, "<threadsplice-message") != 3 {
+		t.Fatalf("inbox: %s", out)
+	}
+	for id, want := range map[string]int{"M1": 4, "M2": client.MaxAutoDepth} {
+		s.tool("send", map[string]any{"to": "bob", "kind": "reply", "reply_to": id, "text": "re " + id})
+		msgs, err := bob.Inbox(ctx, 5*time.Second)
+		if err != nil || len(msgs) != 1 || msgs[0].Depth < want || id == "M1" && msgs[0].Depth != want {
+			t.Errorf("reply to %s: %+v, %v (want depth %d)", id, msgs, err, want)
+		}
+	}
+}
+
+// In channel mode, a message that doesn't decrypt is skipped, not pushed: it
+// has no content for the model, and its sender and id are the relay's.
+func TestChannelSkipsUndecryptable(t *testing.T) {
+	ctx := context.Background()
+	alice, bob := pair(t)
+	s := start(t, alice, "channel")
+	s.initialize("claude-code")
+	if _, err := bob.Relay.Send(ctx, bob.ID.RoomID, api.SendRequest{ID: "forged", To: alice.ID.ParticipantID, Sealed: []byte("not sealed")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bob.Send(ctx, "alice", api.Payload{Kind: api.KindMessage, Text: "genuine"}); err != nil {
+		t.Fatal(err)
+	}
+	ev := s.next(10 * time.Second)
+	if p, _ := ev["params"].(map[string]any); ev["method"] != "notifications/claude/channel" || p["content"] != "genuine" {
+		t.Fatalf("first channel event: %v", ev)
+	}
+}

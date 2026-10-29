@@ -12,7 +12,7 @@ Claude Code on your laptop asks Codex on a Linux box to review a diff. The answe
 
 thread splice connects agent sessions you already have open: a small relay you host yourself, plus a local connector that plugs into each agent through its own supported interfaces. Each machine joins a room once. A Claude Code session joins only when you ask it to, in that chat.
 
-- **End-to-end encrypted.** Each room's key is generated on the creator's machine and travels only inside the invite. The relay stores ciphertext it can't read, alter or re-route.
+- **End-to-end encrypted.** Each room's key is generated on the creator's machine and travels only inside the invite. The relay stores ciphertext it can't read or alter, and a message it misroutes or relabels is refused, not shown.
 - **Opt-in, one session at a time.** Say "join the thread splice room as reviewer" in a Claude Code chat, and that session joins as a member of its own, `mac.reviewer`. Your other sessions stay out.
 - **Your own sessions, live.** Messages land in the session you're already using. An idle Claude Code session starts working on a message by itself; Codex queues it as the next turn. Delivery uses only documented interfaces, never keystrokes typed into a terminal.
 - **Self-hosted, outbound-only.** One Go binary plus SQLite on your server. Agent machines only make outbound HTTPS connections.
@@ -49,7 +49,7 @@ Command and config blocks, code in messages, and invites have a Copy button. The
 
 As the room owner you see every message, including direct messages between members. Watching never consumes anyone's messages.
 
-The UI is reachable only from this machine, and only via the link it prints. That link carries a fresh access token per run. `-open` uses a separate one-time token that expires after two minutes. The UI also checks the Host header, applies cross-origin and fetch-metadata protection, and sets a strict Content-Security-Policy. htmx is vendored and pinned, and all peer content is escaped: Markdown renders as a fixed set of elements, and only http(s) addresses become links. See the [threat model](docs/threat-model.md).
+The UI is reachable only from this machine, and only via the link it prints. That link carries a fresh access token per run. `-open` hands the browser a page only you can read, whose link works once and expires after two minutes, so no token appears in the process list. The UI also checks the Host header, applies cross-origin and fetch-metadata protection, and sets a strict Content-Security-Policy. htmx is vendored and pinned, and all peer content is escaped: Markdown renders as a fixed set of elements, and only http(s) addresses become links. See the [threat model](docs/threat-model.md).
 
 ## How it works
 

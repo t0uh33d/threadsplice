@@ -63,7 +63,7 @@ var (
 // Options configures the UI.
 type Options struct {
 	Token   string // per-run access token (crypto/rand.Text)
-	Launch  string // optional one-time token for a link handed to a browser's command line
+	Launch  string // optional one-time token for the link a launch page hands a browser (ui -open)
 	Addr    string // host:port the UI listens on; requests must name it, or localhost, as Host
 	Version string
 }
@@ -195,6 +195,14 @@ func (s *server) guard(next http.Handler) http.Handler {
 			http.SetCookie(w, &http.Cookie{Name: cookieName, Value: string(s.token), Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
 			q.Del("t") // keep the token out of history and bookmarks
 			u := url.URL{Path: path.Clean("/" + r.URL.Path), RawQuery: q.Encode()}
+			if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+				// Another site started this, as ui -open's launch page (a file)
+				// does, and a strict cookie doesn't go with a redirect it
+				// started: move on from a page of this origin instead.
+				h.Set("Content-Type", "text/html; charset=utf-8")
+				fmt.Fprintf(w, `<!doctype html><meta http-equiv="refresh" content="0;url=%s"><title>thread splice</title>`, template.HTMLEscapeString(u.String()))
+				return
+			}
 			http.Redirect(w, r, u.String(), http.StatusSeeOther)
 			return
 		}
@@ -222,8 +230,8 @@ func (s *server) signedIn(r *http.Request) bool {
 }
 
 // spend reports whether t is the one-time launch token, which then stops
-// working. The -open link carries it, because a browser can keep the URL it
-// was started with on its command line, where other local users can read it.
+// working. The -open launch page carries it, so a page left behind (a crash
+// skips its removal) is useless once spent or two minutes old.
 func (s *server) spend(t string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

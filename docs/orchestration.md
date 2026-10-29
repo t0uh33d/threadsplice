@@ -57,7 +57,7 @@ fi
 exec threadsplice bridge codex -as "$name" -cwd /work
 ```
 
-- **`THREADSPLICE_HOME`.** Put it on a volume (an `emptyDir` will do) so a restarted container keeps its identity instead of joining again. A pod rescheduled under a new name joins as a new member. The old one stays in `peers` as offline until the owner revokes it.
+- **`THREADSPLICE_HOME`.** Put it on a volume (an `emptyDir` will do) so a restarted container keeps its identity instead of joining again. A pod rescheduled under a new name joins as a new member. The old one stays in `peers` as offline until the owner revokes it. Revoking it spends the fleet invite it joined with, so update the secret with a new invite first.
 - **The image** needs the agent's CLI and its login (for the Codex bridge, Codex ≥ 0.151), as well as `threadsplice`.
 - **Secrets.** Store the invite as a secret (a Kubernetes Secret, a CI secret): it contains the room key. Give each bridge's container only that bridge's identity, because a peer can ask its agent to read files.
 - **Networks.** HTTPS to the relay works across networks and clouds. Inside a private network (a VPC, a cluster or a service mesh), plain `http://` to a relay that isn't on loopback needs `THREADSPLICE_INSECURE=1` on the agents. Use it only on a network you trust: message content stays encrypted, but bearer tokens cross the network in the clear.

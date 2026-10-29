@@ -331,7 +331,7 @@ func TestSessionDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkEnvelope(t, f.Message.Content, client.Message{ID: askID, FromName: "bob", Direct: true, Payload: api.Payload{Kind: api.KindAsk, Text: body}})
-	eventually(t, "the ack", func() bool { return acked(t, bob, child) > 0 })
+	eventually(t, "the ack", func() bool { return acked(t, child) > 0 })
 	if out := s.tool("ask", map[string]any{"to": "bob", "text": "and handlers.go?"}); !strings.Contains(out, "delivered into this session") {
 		t.Errorf("ask with live delivery: %s", out)
 	}

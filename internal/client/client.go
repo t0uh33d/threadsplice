@@ -44,16 +44,32 @@ type StatusError struct {
 // Error keeps the relay's text to one short printable line: it can end up in
 // a tool result a model reads, and the relay is not trusted with that.
 func (e *StatusError) Error() string {
-	msg := strings.Map(func(r rune) rune {
+	return fmt.Sprintf("relay: %s (HTTP %d)", clip(e.Msg), e.Code)
+}
+
+// RequestError is a relay request that failed without a StatusError: net/http
+// got no usable response, or a 2xx body didn't decode. Both can quote the
+// relay's response (a Location net/http can't parse, the last one when it stops
+// following redirects, a malformed header line, a time the decoder can't
+// parse), so the text is clipped like StatusError's. Unwrap keeps errors.Is
+// and errors.As working (context errors, *url.Error).
+type RequestError struct{ Err error }
+
+func (e *RequestError) Error() string { return clip(e.Err.Error()) }
+func (e *RequestError) Unwrap() error { return e.Err }
+
+// clip keeps relay-supplied text to one short printable line.
+func clip(s string) string {
+	s = strings.Map(func(r rune) rune {
 		if unicode.IsPrint(r) {
 			return r
 		}
 		return ' '
-	}, e.Msg)
-	if len(msg) > 200 {
-		msg = strings.ToValidUTF8(msg[:200], "") + "…"
+	}, s)
+	if len(s) > 200 {
+		s = strings.ToValidUTF8(s[:200], "") + "…"
 	}
-	return fmt.Sprintf("relay: %s (HTTP %d)", msg, e.Code)
+	return s
 }
 
 // CheckRelayURL rejects relay URLs that would send bearer tokens in cleartext.
@@ -93,7 +109,7 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return err
+		return &RequestError{Err: err}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
@@ -105,7 +121,9 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 		return &StatusError{Code: resp.StatusCode, Msg: e.Error}
 	}
 	if out != nil {
-		return json.NewDecoder(resp.Body).Decode(out)
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			return &RequestError{Err: err}
+		}
 	}
 	return nil
 }
@@ -114,6 +132,16 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 func (c *Client) CreateRoom(ctx context.Context, name, owner string) (api.Membership, error) {
 	var m api.Membership
 	err := c.do(ctx, "POST", "/v1/rooms", api.CreateRoomRequest{Name: name, Owner: owner}, &m)
+	return checkMembership(m, err)
+}
+
+// checkMembership checks the ids of a membership the relay just made, as
+// CreateChild does: they are saved, and the participant id is sealed into
+// every message the member sends. Callers check the room name.
+func checkMembership(m api.Membership, err error) (api.Membership, error) {
+	if err == nil && (!relayID.MatchString(m.RoomID) || !relayID.MatchString(m.ParticipantID)) {
+		return api.Membership{}, errors.New("the relay returned an invalid membership")
+	}
 	return m, err
 }
 
@@ -140,7 +168,7 @@ func (c *Client) CreateInvite(ctx context.Context, room string, ttl time.Duratio
 func (c *Client) Join(ctx context.Context, invite, name string) (api.Membership, error) {
 	var m api.Membership
 	err := c.do(ctx, "POST", "/v1/join", api.JoinRequest{Invite: invite, Name: name}, &m)
-	return m, err
+	return checkMembership(m, err)
 }
 
 // ErrChildrenUnsupported is CreateChild's error from a relay that predates

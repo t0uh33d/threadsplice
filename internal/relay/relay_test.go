@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -886,26 +887,33 @@ BEGIN SELECT RAISE(ABORT, 'session members are one level deep'); END;
 PRAGMA user_version = 2;
 `
 
-// A v1 or v2 database migrates when a relay opens it: its data survives,
-// user_version becomes 3, members stay one level deep, and an invite made
+// v3Additions is what v3 relays added to v2: invites with several uses.
+const v3Additions = `
+ALTER TABLE invites ADD COLUMN uses_left INTEGER NOT NULL DEFAULT 1;
+PRAGMA user_version = 3;
+`
+
+// A v1, v2 or v3 database migrates when a relay opens it: its data survives,
+// user_version becomes 4, members stay one level deep, and an invite made
 // before the upgrade still admits exactly one join. A fresh database starts
-// at v3, and a newer one is refused.
+// at v4, and a newer one is refused.
 func TestMigrate(t *testing.T) {
 	t.Run("v1", func(t *testing.T) { testMigrate(t, v1Schema) })
 	t.Run("v2", func(t *testing.T) { testMigrate(t, v1Schema+v2Additions) })
+	t.Run("v3", func(t *testing.T) { testMigrate(t, v1Schema+v2Additions+v3Additions) })
 
 	var v int
 	fresh := filepath.Join(t.TempDir(), "fresh.db")
 	startRelay(t, fresh, 0)
-	if err := rawDB(t, fresh).QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 3 {
-		t.Fatalf("fresh database's user_version = %d, %v; want 3", v, err)
+	if err := rawDB(t, fresh).QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 4 {
+		t.Fatalf("fresh database's user_version = %d, %v; want 4", v, err)
 	}
 	newer := filepath.Join(t.TempDir(), "newer.db")
-	if _, err := rawDB(t, newer).Exec("PRAGMA user_version = 4"); err != nil {
+	if _, err := rawDB(t, newer).Exec("PRAGMA user_version = 5"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := relay.New(relay.Config{DBPath: newer, AdminToken: admin}); err == nil || !strings.Contains(err.Error(), "newer than this relay (v3)") {
-		t.Fatalf("opening a v4 database: %v", err)
+	if _, err := relay.New(relay.Config{DBPath: newer, AdminToken: admin}); err == nil || !strings.Contains(err.Error(), "newer than this relay (v4)") {
+		t.Fatalf("opening a v5 database: %v", err)
 	}
 }
 
@@ -965,8 +973,8 @@ func testMigrate(t *testing.T, ddl string) {
 
 	db := rawDB(t, path)
 	var v int
-	if err := db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 3 {
-		t.Fatalf("user_version = %d, %v; want 3", v, err)
+	if err := db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v != 4 {
+		t.Fatalf("user_version = %d, %v; want 4", v, err)
 	}
 	for _, pair := range [][]any{
 		{"P1", sub.ID.ParticipantID}, // a member under a member
@@ -975,5 +983,248 @@ func testMigrate(t *testing.T, ddl string) {
 		if _, err := db.Exec(`INSERT INTO children (room_id, child_id, parent_id) VALUES ('R1', ?, ?)`, pair...); err == nil || !strings.Contains(err.Error(), "one level deep") {
 			t.Errorf("child %v: %v, want the one-level trigger", pair, err)
 		}
+	}
+}
+
+// Revoking a member ends what its queued messages make other members' agents
+// do: inboxes leave them out at once, its machine's session members' too,
+// while the owner's log and the recipient's history keep them.
+func TestRevokeDropsQueuedMessages(t *testing.T) {
+	ctx := context.Background()
+	ts := startRelay(t, filepath.Join(t.TempDir(), "relay.db"), 0)
+	ag := room(t, ts.URL, "proj", "alice", "bob", "carol", "mac")
+	alice, bob, carol, mac := ag[0], ag[1], ag[2], ag[3]
+	sub := member(t, mac, "mac.s")
+	for _, s := range []struct {
+		from *client.Agent
+		to   string
+	}{{bob, "carol"}, {bob, ""}, {sub, "carol"}} {
+		if _, err := s.from.Send(ctx, s.to, api.Payload{Kind: api.KindAsk, Text: "run this"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, a := range []*client.Agent{bob, mac} {
+		if err := alice.Relay.Revoke(ctx, alice.ID.RoomID, a.ID.ParticipantID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if msgs, err := carol.Inbox(ctx, 0); err != nil || len(msgs) != 0 {
+		t.Errorf("carol's inbox after the revocations = %+v, %v; want nothing", msgs, err)
+	}
+	if log, _, err := alice.Log(ctx, 0, 0); err != nil || len(log) != 3 {
+		t.Errorf("the owner's log = %d messages, %v; want all 3", len(log), err)
+	}
+	if hist, err := carol.Relay.RoomLog(ctx, carol.ID.RoomID, 0, 0); err != nil || len(hist) != 3 {
+		t.Errorf("carol's history = %d messages, %v; want all 3", len(hist), err)
+	}
+	if _, err := alice.Send(ctx, "carol", api.Payload{Kind: api.KindMessage, Text: "still here"}); err != nil {
+		t.Fatal(err)
+	}
+	if msgs, err := carol.Inbox(ctx, 0); err != nil || len(msgs) != 1 || msgs[0].Text != "still here" {
+		t.Errorf("carol's inbox after a new message = %+v, %v", msgs, err)
+	}
+}
+
+// Revoking a member spends the invite it joined with, which a fleet invite
+// may have uses left on, and any it made; an owner that revoked itself leaves
+// no invite that admits anyone.
+func TestRevokeSpendsInvites(t *testing.T) {
+	ctx := context.Background()
+	ts := startRelay(t, filepath.Join(t.TempDir(), "relay.db"), 0)
+	alice := room(t, ts.URL, "proj", "alice")[0]
+	invite := func(uses int) string {
+		inv, err := alice.Relay.CreateInvite(ctx, alice.ID.RoomID, time.Hour, uses)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return inv.Token
+	}
+	fleet, other := invite(5), invite(1)
+	anon := client.New(ts.URL, "")
+	pod, err := anon.Join(ctx, fleet, "pod-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := alice.Relay.Revoke(ctx, alice.ID.RoomID, pod.ParticipantID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := anon.Join(ctx, fleet, "pod-2"); status(err) != 403 {
+		t.Errorf("the revoked pod's fleet invite: %v, want HTTP 403", err)
+	}
+	if _, err := anon.Join(ctx, other, "pod-3"); err != nil {
+		t.Errorf("an invite the revoked pod never held: %v", err)
+	}
+	last := invite(1)
+	if err := alice.Relay.Revoke(ctx, alice.ID.RoomID, alice.ID.ParticipantID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := anon.Join(ctx, last, "pod-4"); status(err) != 403 {
+		t.Errorf("an invite from an owner that revoked itself: %v, want HTTP 403", err)
+	}
+}
+
+// No name may be another participant's id: clients read one string as
+// either (revoke, send -to), so the owner's revoke could hit the wrong member.
+func TestNameEqualToID(t *testing.T) {
+	ctx := context.Background()
+	ts := startRelay(t, filepath.Join(t.TempDir(), "relay.db"), 0)
+	ag := room(t, ts.URL, "proj", "alice", "bob")
+	alice, bob := ag[0], ag[1]
+	inv, err := alice.Relay.CreateInvite(ctx, alice.ID.RoomID, time.Hour, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anon := client.New(ts.URL, "")
+	for _, name := range []string{bob.ID.ParticipantID, strings.ToLower(alice.ID.ParticipantID)} {
+		if _, err := anon.Join(ctx, inv.Token, name); status(err) != 409 {
+			t.Errorf("joining as another participant's id %q: %v, want HTTP 409", name, err)
+		}
+	}
+	if _, err := anon.Join(ctx, inv.Token, "carol"); err != nil {
+		t.Errorf("the refusals spent the invite: %v", err)
+	}
+}
+
+// A sender the owner revokes, or whose machine it revokes, while the send's
+// body is still arriving gets 401, and nothing is stored or routed.
+func TestSendRacesRevoke(t *testing.T) {
+	ctx := context.Background()
+	ts := startRelay(t, filepath.Join(t.TempDir(), "relay.db"), 0)
+	ag := room(t, ts.URL, "proj", "alice", "bob", "mac")
+	alice, bob, mac := ag[0], ag[1], ag[2]
+	sub := member(t, mac, "mac.s")
+	for _, c := range []struct{ sender, revoked *client.Agent }{{bob, bob}, {sub, mac}} {
+		body, w := io.Pipe()
+		req, err := http.NewRequest("POST", ts.URL+"/v1/rooms/"+alice.ID.RoomID+"/messages", body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+c.sender.ID.Token)
+		answer := make(chan int, 1)
+		go func() {
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				answer <- 0
+				return
+			}
+			resp.Body.Close()
+			answer <- resp.StatusCode
+		}()
+		w.Write([]byte(`{"id":"late",`)) // sends the headers: the relay authenticates the sender and waits for the rest
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+			ps, err := alice.Peers(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if i := slices.IndexFunc(ps, func(p api.Participant) bool { return p.ID == c.sender.ID.ParticipantID }); i >= 0 && !ps[i].LastSeen.IsZero() {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the relay never authenticated the request")
+			}
+		}
+		if err := alice.Relay.Revoke(ctx, alice.ID.RoomID, c.revoked.ID.ParticipantID); err != nil {
+			t.Fatal(err)
+		}
+		w.Write([]byte(`"sealed":"AAAA"}`))
+		w.Close()
+		if code := <-answer; code != 401 {
+			t.Errorf("%s's send after the revocation: HTTP %d, want 401", c.sender.ID.Name, code)
+		}
+	}
+	if log, _, err := alice.Log(ctx, 0, 0); err != nil || len(log) != 0 {
+		t.Errorf("the owner's log = %+v, %v; want nothing stored", log, err)
+	}
+}
+
+// A member's acknowledgement cursor stops on the direct messages it got, so
+// only that member and the owner may read it.
+func TestAckedSeqPrivate(t *testing.T) {
+	ctx := context.Background()
+	ts := startRelay(t, filepath.Join(t.TempDir(), "relay.db"), 0)
+	ag := room(t, ts.URL, "proj", "alice", "bob", "carol")
+	alice, bob, carol := ag[0], ag[1], ag[2]
+	if _, err := alice.Send(ctx, "bob", api.Payload{Kind: api.KindMessage, Text: "for bob only"}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := bob.Inbox(ctx, 0)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("bob's inbox = %+v, %v", msgs, err)
+	}
+	for _, c := range []struct {
+		observer *client.Agent
+		want     int64
+	}{{carol, 0}, {alice, msgs[0].Seq}, {bob, msgs[0].Seq}} {
+		ps, err := c.observer.Peers(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i := slices.IndexFunc(ps, func(p api.Participant) bool { return p.ID == bob.ID.ParticipantID }); ps[i].AckedSeq != c.want {
+			t.Errorf("bob's cursor as %s sees it = %d, want %d", c.observer.ID.Name, ps[i].AckedSeq, c.want)
+		}
+	}
+}
+
+// Each room numbers its own messages: a member's sends go up by exactly 1
+// whatever other rooms send or retry, and a retry takes no number.
+func TestRoomSeq(t *testing.T) {
+	ctx := context.Background()
+	ts := startRelay(t, filepath.Join(t.TempDir(), "relay.db"), 0)
+	a, b := room(t, ts.URL, "a", "alice")[0], room(t, ts.URL, "b", "bob")[0]
+	send := func(ag *client.Agent, id string) int64 {
+		t.Helper()
+		resp, err := ag.Relay.Send(ctx, ag.ID.RoomID, api.SendRequest{ID: id, Sealed: []byte("x")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.Seq
+	}
+	for i, c := range []struct {
+		ag   *client.Agent
+		id   string
+		want int64
+	}{{a, "a1", 1}, {b, "b1", 1}, {b, "b2", 2}, {b, "b1", 1}, {a, "a2", 2}, {a, "a2", 2}, {a, "a3", 3}} {
+		if got := send(c.ag, c.id); got != c.want {
+			t.Errorf("send %d (%s in room %s): seq %d, want %d", i, c.id, c.ag.ID.RoomName, got, c.want)
+		}
+	}
+}
+
+// After the upgrade to per-room seqs, a cursor past messages that retention
+// already removed still lets its member receive the next message.
+func TestMigrateKeepsCursors(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "relay.db")
+	old := rawDB(t, path)
+	hash := func(tok string) []byte { h := sha256.Sum256([]byte(tok)); return h[:] }
+	now := time.Now().UnixMilli()
+	for _, q := range []struct {
+		sql  string
+		args []any
+	}{
+		{v1Schema + v2Additions + v3Additions, nil},
+		{`INSERT INTO rooms (id, name, created_at) VALUES ('R1', 'proj', ?)`, []any{now}},
+		{`INSERT INTO participants (id, room_id, name, token_hash, owner, created_at) VALUES ('P1', 'R1', 'alice', ?, 1, ?)`, []any{hash("alice-token"), now}},
+		{`INSERT INTO participants (id, room_id, name, token_hash, acked_seq, created_at) VALUES ('P2', 'R1', 'bob', ?, 3, ?)`, []any{hash("bob-token"), now}},
+		{`INSERT INTO messages (room_id, id, sender_id, sealed, created_at) VALUES ('R1', 'm1', 'P1', x'00', ?), ('R1', 'm2', 'P1', x'00', ?), ('R1', 'm3', 'P1', x'00', ?)`, []any{now, now, now}},
+		{`DELETE FROM messages`, nil}, // retention
+	} {
+		if _, err := old.Exec(q.sql, q.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old.Close()
+	ts := startRelay(t, path, 0)
+	key := e2ee.NewKey()
+	id := func(pid, name string) client.Identity {
+		return client.Identity{Alias: name, Relay: ts.URL, RoomID: "R1", RoomName: "proj", ParticipantID: pid, Name: name,
+			Owner: pid == "P1", Token: name + "-token", RoomKey: key.String()}
+	}
+	alice, bob := mustAgent(t, id("P1", "alice")), mustAgent(t, id("P2", "bob"))
+	if _, err := alice.Send(ctx, "", api.Payload{Kind: api.KindMessage, Text: "after the upgrade"}); err != nil {
+		t.Fatal(err)
+	}
+	if msgs, err := bob.Inbox(ctx, 0); err != nil || len(msgs) != 1 || msgs[0].Seq != 4 {
+		t.Fatalf("bob's inbox after the upgrade = %+v, %v; want the new message at seq 4", msgs, err)
 	}
 }

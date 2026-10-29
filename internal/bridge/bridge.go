@@ -93,6 +93,11 @@ func handle(ctx context.Context, a *client.Agent, s Session, m client.Message, o
 	if m.Err != nil {
 		return fmt.Errorf("undecryptable message: %w", m.Err)
 	}
+	// The owner may have revoked the sender since this page was fetched: its
+	// access has ended, and so has what it can make this agent do.
+	if a.Revoked(ctx, m.From) {
+		return fmt.Errorf("sender %q was revoked; not handled", m.FromName)
+	}
 	ask := m.Kind == api.KindAsk
 	reply := func(text string) error {
 		return sendReply(ctx, a, m.From, fit(api.Payload{Kind: api.KindReply, ReplyTo: m.ID, Text: text, Depth: m.Depth + 1}), opt.Log)
@@ -137,8 +142,8 @@ func sendReply(ctx context.Context, a *client.Agent, to string, p api.Payload, l
 			return nil
 		case ctx.Err() != nil:
 			return ctx.Err()
-		case errors.As(err, &se) && se.Code < 500 && se.Code != http.StatusTooManyRequests:
-			return err // the relay refused it (asker revoked, ...): retrying won't help
+		case errors.Is(err, client.ErrNoParticipant), errors.As(err, &se) && se.Code < 500 && se.Code != http.StatusTooManyRequests:
+			return err // the asker was revoked, or the relay refused it: retrying won't help
 		case attempt == 10:
 			return fmt.Errorf("reply not delivered after %d attempts: %w", attempt, err)
 		}

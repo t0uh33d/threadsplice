@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -340,6 +342,13 @@ func TestRoomCreateAndJoin(t *testing.T) {
 	if !strings.Contains(out, `Revoked "`+machine+`.repo".`) {
 		t.Errorf("revoke a session member: %s", out)
 	}
+	// It refuses the owner itself, which would leave the room without one,
+	// and a member revoked already.
+	for arg, want := range map[string]string{machine: "is you", machine + "-2": "revoked already"} {
+		if err := run(ctx, []string{"revoke", "-as", machine, arg}); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("revoke %s: %v, want %q", arg, err, want)
+		}
+	}
 }
 
 // invite -uses lets a fleet join with one invite. ask hands each recipient
@@ -421,6 +430,88 @@ func TestFleetAndAsk(t *testing.T) {
 	})
 	if !strings.Contains(out, "w1 again") || askErr == nil || !strings.Contains(askErr.Error(), `no reply from "w2" within 2s`) {
 		t.Fatalf("ask with a reply missing: %v\n%s", askErr, out)
+	}
+
+	// Only the member asked can answer: the owner, who reads every direct
+	// message, can't end w1's wait for w2 with a reply of its own.
+	lead, err := client.OpenAgent("lead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			msgs, _, _ := lead.Log(ctx, 0, 0)
+			for _, m := range msgs {
+				if m.Text == "status?" && m.To == workers["w2"].ID.ParticipantID {
+					lead.Send(ctx, "w1", api.Payload{Kind: api.KindReply, ReplyTo: m.ID, Text: "forged"})
+					return
+				}
+			}
+		}
+	}()
+	out = capture(t, func() error {
+		askErr = run(ctx, []string{"ask", "-as", "w1", "-to", "w2", "-wait", "2s", "status?"})
+		return nil
+	})
+	if !strings.Contains(out, "forged") || askErr == nil || !strings.Contains(askErr.Error(), `no reply from "w2"`) {
+		t.Fatalf("ask answered by the owner: %v\n%s", askErr, out)
+	}
+}
+
+// ui -open puts no token on the browser's command line: it hands the browser
+// a page only this user can read, whose one-time link signs in once, and the
+// page goes when the UI stops.
+func TestUIOpen(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	t.Setenv("THREADSPLICE_HOME", t.TempDir())
+	opened := make(chan string, 1)
+	old := openBrowser
+	openBrowser = func(target string) error { opened <- target; return nil }
+	t.Cleanup(func() { openBrowser = old })
+	done := make(chan error, 1)
+	go func() { done <- cmdUI(ctx, []string{"-addr", "127.0.0.1:0", "-open"}) }()
+	var page string
+	select {
+	case page = <-opened:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no browser opened")
+	}
+	if strings.Contains(page, "t=") || strings.Contains(page, "http") {
+		t.Fatalf("the browser's argument carries a link: %q", page)
+	}
+	b, err := os.ReadFile(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := regexp.MustCompile(`url=(http://[^"]+)"`).FindStringSubmatch(string(b))
+	if link == nil {
+		t.Fatalf("launch page:\n%s", b)
+	}
+	if runtime.GOOS != "windows" {
+		for p, want := range map[string]os.FileMode{page: 0o600, filepath.Dir(page): 0o700 | os.ModeDir} {
+			if fi, err := os.Stat(p); err != nil || fi.Mode() != want {
+				t.Errorf("%s: mode %v, %v; want %v", p, fi.Mode(), err, want)
+			}
+		}
+	}
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	for i, want := range []int{http.StatusSeeOther, http.StatusUnauthorized} {
+		resp, err := noRedirect.Get(html.UnescapeString(link[1]))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Errorf("launch link, use %d: HTTP %d, want %d", i+1, resp.StatusCode, want)
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Dir(page)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the launch page outlived the UI: %v", err)
 	}
 }
 

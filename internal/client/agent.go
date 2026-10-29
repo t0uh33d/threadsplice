@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
@@ -77,7 +78,10 @@ func (a *Agent) Peers(ctx context.Context) ([]api.Participant, error) {
 		// Names reach models (envelopes, notices); a relay is not trusted to
 		// keep them to its own naming rule.
 		if !api.ValidName(p.Name) {
-			ps[i].Name = "invalid-name-" + p.ID[:min(6, len(p.ID))]
+			ps[i].Name = "invalid-name"
+			if relayID.MatchString(p.ID) { // only an id of the relay's own shape may reach a model
+				ps[i].Name += "-" + p.ID[:min(6, len(p.ID))]
+			}
 		}
 		if !peerState.MatchString(p.State) {
 			ps[i].State = ""
@@ -129,27 +133,78 @@ func (a *Agent) firstSighting(id string) bool {
 	return true
 }
 
-// resolve maps participant names (or ids) to ids, with one lookup for all.
-func (a *Agent) resolve(ctx context.Context, to ...string) ([]string, error) {
+// ErrNoParticipant is the refusal of a name or id that is no active
+// participant's: revoked, or never there. Retrying can't help.
+var ErrNoParticipant = errors.New("no active participant")
+
+// Lookup finds the participant s stands for, by name or by id, revoked ones
+// included. A string that is one participant's name and another's id is
+// refused, not guessed at.
+func Lookup(ps []api.Participant, s string) (api.Participant, error) {
+	var hit []api.Participant
+	for _, p := range ps {
+		if p.Name == s || p.ID == s {
+			hit = append(hit, p)
+		}
+	}
+	switch len(hit) {
+	case 0:
+		return api.Participant{}, ErrNoParticipant
+	case 1:
+		return hit[0], nil
+	}
+	return api.Participant{}, fmt.Errorf("%q is the name of one participant and the id of another: use the id of the one you mean (peers -json)", s)
+}
+
+// resolve maps participant ids (or names) to ids, with one lookup for all, and
+// returns the member-list name of each, which sendTo seals. An id always means
+// its own participant: a revoked one is refused, never stood in for by a
+// member whose name is that id. A name counts only when it is nobody's id. A
+// name or id the list holds twice is refused: an honest relay never lists one,
+// since revoked members keep their names.
+func (a *Agent) resolve(ctx context.Context, to ...string) (ids, names []string, err error) {
 	ps, err := a.Peers(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	ids := make([]string, 0, len(to))
 	for _, t := range to {
-		i := slices.IndexFunc(ps, func(p api.Participant) bool { return (p.Name == t || p.ID == t) && !p.Revoked })
+		i := slices.IndexFunc(ps, func(p api.Participant) bool { return p.ID == t })
 		if i < 0 {
-			var names []string
+			i = slices.IndexFunc(ps, func(p api.Participant) bool { return p.Name == t })
+		}
+		if i < 0 || ps[i].Revoked {
+			var known []string
 			for _, p := range ps {
 				if p.ID != a.ID.ParticipantID && !p.Revoked {
-					names = append(names, p.Name)
+					known = append(known, p.Name)
 				}
 			}
-			return nil, fmt.Errorf("no active participant %q in room %q (participants: %s)", t, a.ID.RoomName, strings.Join(names, ", "))
+			return nil, nil, fmt.Errorf("%w %q in room %q (participants: %s)", ErrNoParticipant, t, a.ID.RoomName, strings.Join(known, ", "))
 		}
-		ids = append(ids, ps[i].ID)
+		for j, p := range ps {
+			if j != i && (p.ID == ps[i].ID || p.Name == ps[i].Name) {
+				return nil, nil, fmt.Errorf("the relay lists %q more than once in room %q; not sending", t, a.ID.RoomName)
+			}
+		}
+		ids, names = append(ids, ps[i].ID), append(names, ps[i].Name)
 	}
-	return ids, nil
+	return ids, names, nil
+}
+
+// Revoked reports whether the owner has revoked participant id, or the machine
+// membership it belongs to, by a fresh member list. A consumer that fetched
+// messages a while ago checks their sender with it before acting on one.
+func (a *Agent) Revoked(ctx context.Context, id string) bool {
+	ps, err := a.Peers(ctx)
+	if err != nil {
+		return false // the relay itself leaves revoked senders out of inboxes
+	}
+	i := slices.IndexFunc(ps, func(p api.Participant) bool { return p.ID == id })
+	if i < 0 {
+		return false
+	}
+	parent := ps[i].Parent
+	return ps[i].Revoked || parent != "" && slices.ContainsFunc(ps, func(p api.Participant) bool { return p.ID == parent && p.Revoked })
 }
 
 // Recipients splits a comma-separated list of participant names, dropping
@@ -173,15 +228,15 @@ func (a *Agent) Send(ctx context.Context, to string, p api.Payload) (string, err
 // SendID is Send with a caller-chosen message id: sending again with the same
 // id after a failure is safe, because the relay deduplicates it.
 func (a *Agent) SendID(ctx context.Context, id, to string, p api.Payload) (string, error) {
-	toID := ""
+	toID, toName := "", ""
 	if to != "" {
-		ids, err := a.resolve(ctx, to)
+		ids, names, err := a.resolve(ctx, to)
 		if err != nil {
 			return "", err
 		}
-		toID = ids[0]
+		toID, toName = ids[0], names[0]
 	}
-	return id, a.sendTo(ctx, id, toID, p)
+	return id, a.sendTo(ctx, id, toID, toName, p)
 }
 
 // SendEach sends p to each participant in `to` as a direct message of its own,
@@ -189,22 +244,31 @@ func (a *Agent) SendID(ctx context.Context, id, to string, p api.Payload) (strin
 // checked first, so a typo sends nothing. It returns the ids sent, in order;
 // after a failure part way, those that went out before it.
 func (a *Agent) SendEach(ctx context.Context, to []string, p api.Payload) ([]string, error) {
-	toIDs, err := a.resolve(ctx, to...)
+	ids, _, err := a.SendEachTo(ctx, to, p)
+	return ids, err
+}
+
+// SendEachTo is SendEach that also returns each recipient's participant id, in
+// the same order as the message ids, so a caller waiting for replies can
+// require each one to come from the participant it asked.
+func (a *Agent) SendEachTo(ctx context.Context, to []string, p api.Payload) (ids, toIDs []string, err error) {
+	toIDs, names, err := a.resolve(ctx, to...)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	ids := make([]string, 0, len(to))
-	for _, t := range toIDs {
+	ids = make([]string, 0, len(to))
+	for i, t := range toIDs {
 		id := rand.Text()
-		if err := a.sendTo(ctx, id, t, p); err != nil {
-			return ids, err
+		if err := a.sendTo(ctx, id, t, names[i], p); err != nil {
+			return ids, toIDs[:len(ids)], err
 		}
 		ids = append(ids, id)
 	}
-	return ids, nil
+	return ids, toIDs, nil
 }
 
-func (a *Agent) sendTo(ctx context.Context, id, toID string, p api.Payload) error {
+func (a *Agent) sendTo(ctx context.Context, id, toID, toName string, p api.Payload) error {
+	p.Sender, p.Addressee = a.ID.Name, toName // inside the ciphertext: the relay can't change them
 	pt, err := json.Marshal(p)
 	if err != nil {
 		return err
@@ -223,13 +287,16 @@ func (a *Agent) Fetch(ctx context.Context, after int64, wait time.Duration, stat
 	if err != nil || len(envs) == 0 {
 		return nil, 0, err
 	}
+	if err := a.known(ctx, envs); err != nil {
+		return nil, 0, err
+	}
 	last = envs[len(envs)-1].Seq
 	out := make([]Message, 0, len(envs))
 	for _, e := range envs {
 		if e.To != "" && e.To != a.ID.ParticipantID {
 			continue // a relay handing us someone else's DM; never present it as ours
 		}
-		m := a.open(ctx, e)
+		m := a.open(e)
 		// Only authenticated messages count as sightings, so a forged copy can't
 		// suppress the genuine one.
 		if m.Err == nil && !a.firstSighting(e.From+"/"+e.ID) {
@@ -248,21 +315,65 @@ func (a *Agent) Log(ctx context.Context, after int64, wait time.Duration) (msgs 
 	if err != nil || len(envs) == 0 {
 		return nil, after, err
 	}
+	if err := a.known(ctx, envs); err != nil {
+		return nil, after, err
+	}
 	for _, e := range envs {
 		if !a.ID.Owner && e.To != "" && e.To != a.ID.ParticipantID && e.From != a.ID.ParticipantID {
 			continue // only the owner's view includes DMs between others
 		}
-		msgs = append(msgs, a.open(ctx, e))
+		msgs = append(msgs, a.open(e))
 	}
 	return msgs, envs[len(envs)-1].Seq, nil
 }
 
-// open decrypts one envelope and resolves participant names.
-func (a *Agent) open(ctx context.Context, e api.Envelope) Message {
+// known makes sure the names of everyone envs mention are at hand, fetching
+// the member list once if one isn't. open checks sealed names against them,
+// so a fetch that fails is an error: nothing is consumed unchecked, and the
+// caller tries again later.
+func (a *Agent) known(ctx context.Context, envs []api.Envelope) error {
+	for _, e := range envs {
+		_, from := a.name(e.From)
+		_, to := a.name(e.To)
+		if !from || e.To != "" && !to {
+			_, err := a.Peers(ctx)
+			return err
+		}
+	}
+	return nil
+}
+
+// ErrNames is a message's error when the names sealed in it don't match the
+// member list the relay serves: it renamed members, or a direct message was
+// addressed to someone else.
+var ErrNames = errors.New("the names sealed in this message don't match the relay's member list (renamed or misrouted)")
+
+// maxDepth is the largest depth a received message keeps (see open): far
+// above any chain's budget, and low enough that adding 1 can't overflow an
+// int on any platform.
+const maxDepth = 1 << 30
+
+// open decrypts one envelope and resolves participant names, which the
+// caller made sure of (known).
+func (a *Agent) open(e api.Envelope) Message {
 	m := Message{Seq: e.Seq, ID: e.ID, From: e.From, To: e.To, Direct: e.To != "", At: e.CreatedAt}
 	pt, err := a.key.Open(e2ee.Header{Room: a.ID.RoomID, From: e.From, To: e.To, ID: e.ID}, e.Sealed)
 	if err == nil {
 		err = json.Unmarshal(pt, &m.Payload)
+	}
+	if err == nil && m.Sender != "" { // connectors from before sealed names send none
+		from, _ := a.name(e.From)
+		to := ""
+		switch e.To {
+		case "":
+		case a.ID.ParticipantID:
+			to = a.ID.Name // from this member's own file: the relay can't remap it
+		default:
+			to, _ = a.name(e.To) // the owner's view of direct messages between others
+		}
+		if from != m.Sender || m.Addressee != to {
+			m.Payload, err = api.Payload{}, ErrNames // no text reaches a model or a page
+		}
 	}
 	m.Err = err
 	switch m.Kind { // peer-controlled: anything unexpected is a plain message
@@ -273,18 +384,34 @@ func (a *Agent) open(ctx context.Context, e api.Envelope) Message {
 	if !messageID.MatchString(m.ReplyTo) {
 		m.ReplyTo = ""
 	}
-	if _, ok := a.name(e.From); !ok {
-		a.Peers(ctx) // best effort: unknown sender, refresh names
+	// The depth is the peer's word too, and callers add 1 to it (the MCP
+	// server, bridges): out of range, one message would reset or wrap a
+	// chain's loop budget. Treat it as a chain that has used its budget up.
+	if m.Depth < 0 || m.Depth > maxDepth {
+		m.Depth = maxDepth
 	}
 	if m.FromName, _ = a.name(e.From); m.FromName == "" {
-		m.FromName = e.From
+		m.FromName = relayShaped(e.From)
 	}
 	if e.To != "" {
 		if m.ToName, _ = a.name(e.To); m.ToName == "" {
-			m.ToName = e.To
+			m.ToName = relayShaped(e.To)
 		}
 	}
+	if !relayID.MatchString(m.ID) {
+		m.ID = "" // not an id the relay mints or accepts: keep it from models
+	}
 	return m
+}
+
+// relayShaped is a relay-supplied id when it has the shape the relay mints and
+// accepts, else a fixed placeholder: ids reach models, and the relay is not
+// trusted with that.
+func relayShaped(id string) string {
+	if relayID.MatchString(id) {
+		return id
+	}
+	return "unknown"
 }
 
 // Ack marks everything up to seq as processed.

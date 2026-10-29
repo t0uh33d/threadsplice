@@ -481,8 +481,9 @@ func (s *server) bind(ctx context.Context, prev *member, a *client.Agent, ps []a
 }
 
 const (
-	maxNamed = 20 // members join's answer names at most: the relay supplies the list
-	maxName  = 32 // characters in a name (api.NameRule)
+	maxNamed  = 20  // members join's answer names at most: the relay supplies the list
+	maxListed = 200 // members the peers tool lists at most, for the same reason
+	maxName   = 32  // characters in a name (api.NameRule)
 )
 
 // leave takes this session out of its room. Its member stays, reserved for

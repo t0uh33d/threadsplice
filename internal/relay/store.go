@@ -21,6 +21,7 @@ var (
 	errFull      = errors.New("too many session members")
 	errTokenUsed = errors.New("token hash already in use")
 	errRate      = errors.New("rate limited")
+	errRevoked   = errors.New("sender revoked") // after auth accepted it
 )
 
 // A clash refuses a name that would blur who is who in a room, because of
@@ -54,7 +55,7 @@ func (c clash) Error() string {
 const maxChildren = 32
 
 // schemaVersion is the user_version of a current database.
-const schemaVersion = 3
+const schemaVersion = 4
 
 // Composite foreign keys on (room_id, participant) make cross-room references
 // impossible at the database level, not just in handler code.
@@ -99,8 +100,8 @@ CREATE TABLE messages (
 	FOREIGN KEY (room_id, recipient_id) REFERENCES participants (room_id, id) ON DELETE CASCADE
 );
 CREATE INDEX messages_room_seq ON messages (room_id, seq);
-` + schemaV2 + schemaV3 + `
-PRAGMA user_version = 3;
+` + schemaV2 + schemaV3 + schemaV4 + `
+PRAGMA user_version = 4;
 `
 
 // schemaV2 adds session members: participants a machine membership creates
@@ -128,6 +129,24 @@ const schemaV3 = `
 ALTER TABLE invites ADD COLUMN uses_left INTEGER NOT NULL DEFAULT 1;
 `
 
+// schemaV4 ties invites to the members that hold them, and numbers each
+// room's messages on their own.
+//   - invite_hash is the invite a member joined with: revoking the member
+//     spends what is left of it, since the member still holds it.
+//   - room_seq is the seq participants see. The rowid counts every room's
+//     messages, so its gaps would tell a member how busy other rooms are.
+//     Existing rooms carry on from the rowid's high-water mark, which keeps
+//     every stored cursor valid, even one past messages retention removed.
+const schemaV4 = `
+ALTER TABLE participants ADD COLUMN invite_hash BLOB;
+ALTER TABLE rooms ADD COLUMN next_seq INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN room_seq INTEGER NOT NULL DEFAULT 0;
+UPDATE messages SET room_seq = seq;
+UPDATE rooms SET next_seq = coalesce((SELECT seq FROM sqlite_sequence WHERE name = 'messages'), 0);
+DROP INDEX messages_room_seq;
+CREATE UNIQUE INDEX messages_room_room_seq ON messages (room_id, room_seq);
+`
+
 type store struct{ db *sql.DB }
 
 func openStore(path string) (*store, error) {
@@ -153,9 +172,11 @@ func openStore(path string) (*store, error) {
 	case 0:
 		ddl = schema
 	case 1:
-		ddl = schemaV2 + schemaV3 + "PRAGMA user_version = 3;"
+		ddl = schemaV2 + schemaV3 + schemaV4 + "PRAGMA user_version = 4;"
 	case 2:
-		ddl = schemaV3 + "PRAGMA user_version = 3;"
+		ddl = schemaV3 + schemaV4 + "PRAGMA user_version = 4;"
+	case 3:
+		ddl = schemaV4 + "PRAGMA user_version = 4;"
 	case schemaVersion:
 	default:
 		db.Close()
@@ -213,7 +234,10 @@ func (s *store) join(ctx context.Context, inviteHash []byte, name string, tokenH
 	m := api.Membership{ParticipantID: rand.Text()}
 	now := ms(time.Now())
 	err := inTx(ctx, s.db, func(tx *sql.Tx) error {
+		// An invite admits only while the member that made it is active: an
+		// owner that revoked itself leaves nobody to answer for newcomers.
 		err := tx.QueryRowContext(ctx, `SELECT i.room_id, r.name FROM invites i JOIN rooms r ON r.id = i.room_id
+			JOIN participants o ON o.room_id = i.room_id AND o.id = i.created_by AND o.revoked_at IS NULL
 			WHERE i.token_hash = ? AND i.used_at IS NULL AND i.expires_at > ?`, inviteHash, now).Scan(&m.RoomID, &m.RoomName)
 		if errors.Is(err, sql.ErrNoRows) {
 			return errInvite
@@ -249,6 +273,14 @@ func (s *store) join(ctx context.Context, inviteHash []byte, name string, tokenH
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
+		// Clients take one string for a name or an id (threadsplice revoke,
+		// send -to), so no name may be another participant's id.
+		err = tx.QueryRowContext(ctx, `SELECT name FROM participants WHERE room_id = ? AND lower(id) = lower(?)`, m.RoomID, name).Scan(&other)
+		if err == nil {
+			return errConflict
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
 		// The right-hand side reads uses_left before this update.
 		if _, err := tx.ExecContext(ctx, `UPDATE invites SET uses_left = uses_left - 1,
 			used_at = CASE WHEN uses_left <= 1 THEN ? END WHERE token_hash = ?`, now, inviteHash); err != nil {
@@ -257,9 +289,9 @@ func (s *store) join(ctx context.Context, inviteHash []byte, name string, tokenH
 		// A newcomer starts at the room's current cursor: retained history is
 		// readable via the history view, but must not arrive as a flood of new
 		// messages (each one would wake the joining agent's session).
-		_, err = tx.ExecContext(ctx, `INSERT INTO participants (id, room_id, name, token_hash, acked_seq, created_at)
-			VALUES (?, ?, ?, ?, (SELECT coalesce(max(seq), 0) FROM messages WHERE room_id = ?), ?)`,
-			m.ParticipantID, m.RoomID, name, tokenHash, m.RoomID, now)
+		_, err = tx.ExecContext(ctx, `INSERT INTO participants (id, room_id, name, token_hash, acked_seq, created_at, invite_hash)
+			VALUES (?, ?, ?, ?, (SELECT next_seq FROM rooms WHERE id = ?), ?, ?)`,
+			m.ParticipantID, m.RoomID, name, tokenHash, m.RoomID, now, inviteHash)
 		return err
 	})
 	return m, err
@@ -339,7 +371,7 @@ func (s *store) createChild(ctx context.Context, roomID, parent, name string, to
 		m.ParticipantID = rand.Text()
 		// Like a newcomer through join, a session member starts at the room's cursor.
 		if _, err := tx.ExecContext(ctx, `INSERT INTO participants (id, room_id, name, token_hash, acked_seq, created_at)
-			VALUES (?, ?, ?, ?, (SELECT coalesce(max(seq), 0) FROM messages WHERE room_id = ?), ?)`,
+			VALUES (?, ?, ?, ?, (SELECT next_seq FROM rooms WHERE id = ?), ?)`,
 			m.ParticipantID, roomID, name, tokenHash, roomID, ms(time.Now())); err != nil {
 			return err
 		}
@@ -402,7 +434,7 @@ func (s *store) participants(ctx context.Context, roomID string) ([]api.Particip
 }
 
 // revoke revokes an active participant and, in the same transaction, its
-// session members.
+// session members and the invites it holds.
 func (s *store) revoke(ctx context.Context, roomID, pid string) error {
 	now := ms(time.Now())
 	return inTx(ctx, s.db, func(tx *sql.Tx) error {
@@ -414,38 +446,64 @@ func (s *store) revoke(ctx context.Context, roomID, pid string) error {
 		if n, _ := res.RowsAffected(); n == 0 {
 			return errNotFound
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE participants SET revoked_at = ?
-			WHERE revoked_at IS NULL AND id IN (SELECT child_id FROM children WHERE parent_id = ?)`, now, pid)
+		if _, err = tx.ExecContext(ctx, `UPDATE participants SET revoked_at = ?
+			WHERE revoked_at IS NULL AND id IN (SELECT child_id FROM children WHERE parent_id = ?)`, now, pid); err != nil {
+			return err
+		}
+		// The member still holds the invite it joined with, which a fleet
+		// invite may have uses left on, and any invite it made: spend them.
+		// ponytail: members who joined before schema v4 have no invite_hash,
+		// so revoking one spends nothing until its invite expires (7 days at
+		// most); spend the room's outstanding invites if that matters.
+		_, err = tx.ExecContext(ctx, `UPDATE invites SET uses_left = 0, used_at = ? WHERE room_id = ? AND used_at IS NULL
+			AND (created_by = ? OR token_hash = (SELECT invite_hash FROM participants WHERE room_id = ? AND id = ?))`,
+			now, roomID, pid, roomID, pid)
 		return err
 	})
 }
 
-// insertMessage durably accepts a message. Retries with the same (sender, id)
-// return the original seq with dup=true instead of storing a second copy.
+// insertMessage durably accepts a message under the room's next seq. Retries
+// with the same (sender, id) return the original seq with dup=true instead of
+// storing a second copy, and take no seq of their own.
 func (s *store) insertMessage(ctx context.Context, roomID, from, to, id string, sealed []byte) (seq int64, dup bool, err error) {
-	var recipient any // NULL addresses the whole room
-	if to != "" {
-		var ok int
-		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM participants WHERE room_id = ? AND id = ? AND revoked_at IS NULL`,
-			roomID, to).Scan(&ok); err != nil {
-			return 0, false, err
+	err = inTx(ctx, s.db, func(tx *sql.Tx) error {
+		// auth accepted the sender when the request began, but the owner may
+		// have revoked it, or its machine, while the body was still arriving.
+		var n int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM participants p
+			LEFT JOIN children c ON c.child_id = p.id LEFT JOIN participants pp ON pp.id = c.parent_id
+			WHERE p.id = ? AND p.room_id = ? AND p.revoked_at IS NULL AND pp.revoked_at IS NULL`, from, roomID).Scan(&n); err != nil {
+			return err
 		}
-		if ok == 0 {
-			return 0, false, errNotFound
+		if n != 1 {
+			return errRevoked
 		}
-		recipient = to
-	}
-	res, err := s.db.ExecContext(ctx, `INSERT INTO messages (room_id, id, sender_id, recipient_id, sealed, created_at)
-		VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (sender_id, id) DO NOTHING`, roomID, id, from, recipient, sealed, ms(time.Now()))
-	if err != nil {
-		return 0, false, err
-	}
-	if n, _ := res.RowsAffected(); n == 1 {
-		seq, err = res.LastInsertId()
-		return seq, false, err
-	}
-	err = s.db.QueryRowContext(ctx, `SELECT seq FROM messages WHERE sender_id = ? AND id = ?`, from, id).Scan(&seq)
-	return seq, true, err
+		var recipient any // NULL addresses the whole room
+		if to != "" {
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM participants WHERE room_id = ? AND id = ? AND revoked_at IS NULL`,
+				roomID, to).Scan(&n); err != nil {
+				return err
+			}
+			if n == 0 {
+				return errNotFound
+			}
+			recipient = to
+		}
+		err := tx.QueryRowContext(ctx, `SELECT room_seq FROM messages WHERE sender_id = ? AND id = ?`, from, id).Scan(&seq)
+		if err == nil {
+			dup = true
+			return nil
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if err := tx.QueryRowContext(ctx, `UPDATE rooms SET next_seq = next_seq + 1 WHERE id = ? RETURNING next_seq`, roomID).Scan(&seq); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO messages (room_id, room_seq, id, sender_id, recipient_id, sealed, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`, roomID, seq, id, from, recipient, sealed, ms(time.Now()))
+		return err
+	})
+	return seq, dup, err
 }
 
 // view selects which messages a reader gets.
@@ -460,15 +518,21 @@ const (
 // messages returns the messages after seq `after` that `me` gets in view v.
 // Callers enforce that only the owner asks for everyone.
 func (s *store) messages(ctx context.Context, roomID, me string, after int64, limit int, v view) ([]api.Envelope, error) {
-	const cols = `SELECT seq, id, sender_id, coalesce(recipient_id, ''), sealed, created_at FROM messages `
-	q, args := cols+`WHERE room_id = ? AND seq > ? AND sender_id <> ? AND (recipient_id IS NULL OR recipient_id = ?) ORDER BY seq LIMIT ?`,
-		[]any{roomID, after, me, me, limit}
+	const cols = `SELECT room_seq, id, sender_id, coalesce(recipient_id, ''), sealed, created_at FROM messages `
+	// Agents consume only what auth would still accept from the sender:
+	// revoking a member (or its machine) ends what its queued messages make
+	// other members' agents do. The history and owner views keep them.
+	q, args := cols+`WHERE room_id = ? AND room_seq > ? AND sender_id <> ? AND (recipient_id IS NULL OR recipient_id = ?)
+		AND sender_id IN (SELECT p.id FROM participants p LEFT JOIN children c ON c.child_id = p.id
+			LEFT JOIN participants pp ON pp.id = c.parent_id WHERE p.room_id = ? AND p.revoked_at IS NULL AND pp.revoked_at IS NULL)
+		ORDER BY room_seq LIMIT ?`,
+		[]any{roomID, after, me, me, roomID, limit}
 	switch v {
 	case history:
-		q, args = cols+`WHERE room_id = ? AND seq > ? AND (recipient_id IS NULL OR recipient_id = ? OR sender_id = ?) ORDER BY seq LIMIT ?`,
+		q, args = cols+`WHERE room_id = ? AND room_seq > ? AND (recipient_id IS NULL OR recipient_id = ? OR sender_id = ?) ORDER BY room_seq LIMIT ?`,
 			[]any{roomID, after, me, me, limit}
 	case everyone:
-		q, args = cols+`WHERE room_id = ? AND seq > ? ORDER BY seq LIMIT ?`, []any{roomID, after, limit}
+		q, args = cols+`WHERE room_id = ? AND room_seq > ? ORDER BY room_seq LIMIT ?`, []any{roomID, after, limit}
 	}
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
